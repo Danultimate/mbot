@@ -38,6 +38,7 @@ def _green_up_lay_stake(back_stake: float, back_odds: float, lay_odds: float) ->
     """
     Compute the Lay stake required to Green Up (equal profit all outcomes).
     Formula: Lay Stake = (Back Stake * Back Odds) / Lay Odds
+    Note: Matchbook applies commission (2% on winnings) at settlement; balance is already net.
     """
     if lay_odds <= 0:
         return 0.0

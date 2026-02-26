@@ -414,6 +414,36 @@ def set_daily_stop_loss_pct(pct: float) -> None:
         conn.close()
 
 
+def get_commission_rate() -> float:
+    """Return commission rate (0–1, e.g. 0.02 for 2%). From settings or config."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = 'commission_rate'"
+        ).fetchone()
+        if row and row[0]:
+            try:
+                return float(row[0])
+            except (ValueError, TypeError):
+                pass
+        return config.COMMISSION_RATE
+    finally:
+        conn.close()
+
+
+def set_commission_rate(rate: float) -> None:
+    """Set commission rate (0–1). UK/ROI: 0.02, other regions: 0.04."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('commission_rate', ?)",
+            (str(rate),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def clear_stop_loss() -> None:
     """Clear stop-loss so trading can resume."""
     conn = get_connection()

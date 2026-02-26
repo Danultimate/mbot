@@ -5,6 +5,7 @@ Supports both Football and Political markets via SPORT_IDS / MARKET_TYPES.
 """
 
 import os
+from typing import Optional
 
 # Phase thresholds (GBP)
 PHASE1_MAX_BANKROLL = 200
@@ -12,6 +13,38 @@ PHASE2_MIN_BANKROLL = 200
 STARTING_BANKROLL = 25
 TARGET_BANKROLL = 5000
 DAILY_ROI_TARGET_PCT = 5.0
+
+# Matchbook commission: 2% on net winnings (UK/ROI/Channel Islands). Other regions: 4%.
+# Commission applies only to profits; balance from API is already post-commission.
+COMMISSION_RATE = 0.02
+
+
+def gross_roi_target_pct(
+    net_target_pct: Optional[float] = None,
+    commission_rate: Optional[float] = None,
+) -> float:
+    """
+    Gross ROI % needed to achieve net_target_pct after commission.
+    net_target_pct defaults to DAILY_ROI_TARGET_PCT.
+    commission_rate defaults to COMMISSION_RATE (use db.get_commission_rate() for user override).
+    """
+    net = net_target_pct if net_target_pct is not None else DAILY_ROI_TARGET_PCT
+    rate = commission_rate if commission_rate is not None else COMMISSION_RATE
+    if rate >= 1.0:
+        return net
+    return net / (1.0 - rate)
+
+
+def net_profit_after_commission(
+    gross_profit: float,
+    commission_rate: Optional[float] = None,
+) -> float:
+    """Apply commission to gross profit. Returns net profit (what you keep)."""
+    if gross_profit <= 0:
+        return gross_profit
+    rate = commission_rate if commission_rate is not None else COMMISSION_RATE
+    return gross_profit * (1.0 - rate)
+
 
 # Daily stop-loss: pause trading if daily loss exceeds this % of start-of-day bankroll
 DAILY_STOP_LOSS_PCT = 10.0

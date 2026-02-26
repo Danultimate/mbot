@@ -159,6 +159,30 @@ def main():
                 st.success("Stop-loss cleared. Trading can resume.")
                 st.rerun()
 
+        commission_rate = db.get_commission_rate()
+        commission_pct = int(commission_rate * 100)
+        new_commission = st.select_slider(
+            "Matchbook commission (%)",
+            options=[2, 3, 4, 5],
+            value=commission_pct if commission_pct in (2, 3, 4, 5) else 2,
+            format_func=lambda x: f"{x}%",
+            key="commission_slider",
+            help="2% UK/ROI, 4% other regions. Used for gross ROI target and profit projections.",
+        )
+        if new_commission / 100.0 != commission_rate:
+            db.set_commission_rate(new_commission / 100.0)
+            st.rerun()
+
+        with st.expander("Commission impact"):
+            example_gross = 100.0
+            example_net = config.net_profit_after_commission(
+                example_gross, commission_rate=db.get_commission_rate()
+            )
+            st.caption(
+                f"£{example_gross:.0f} gross profit → £{example_net:.0f} net "
+                f"(after {int(db.get_commission_rate()*100)}% commission)"
+            )
+
         st.subheader("Market / Sport")
         # Sport IDs: Matchbook uses various IDs - 1=Football common; verify via API /edge/rest/lookups/sports
         sport_options = {
@@ -308,7 +332,12 @@ def main():
     )
     progress = max(0, min(1, progress))
     st.progress(progress)
-    st.caption(f"£{balance:.2f} / £{config.TARGET_BANKROLL}")
+    gross_target = config.gross_roi_target_pct(commission_rate=db.get_commission_rate())
+    st.caption(
+        f"£{balance:.2f} / £{config.TARGET_BANKROLL} • "
+        f"Target: {config.DAILY_ROI_TARGET_PCT}% net daily ROI "
+        f"(≈{gross_target:.1f}% gross after {int(db.get_commission_rate()*100)}% commission)"
+    )
 
     # Active positions table (from API offers, fallback to DB when API unavailable)
     st.subheader("Active Positions")
@@ -368,6 +397,11 @@ def main():
 
     # Trade history table
     st.subheader("Trade History")
+    comm_pct = int(db.get_commission_rate() * 100)
+    st.caption(
+        f"Profit shown is net of Matchbook commission ({comm_pct}% on winnings). "
+        "Balance from API is already post-commission."
+    )
     if trades:
         trade_rows = [
             {
