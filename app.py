@@ -1,21 +1,54 @@
 """
 Streamlit dashboard for the Matchbook Automated Trading System.
 Dark-mode UI with header metrics, goal tracker, active positions, panic hedge, and equity chart.
+Optional password protection via DASHBOARD_PASSWORD env var.
 """
 
 import asyncio
+import os
 import time
 from datetime import datetime, timezone
+from typing import Optional
 
 import plotly.graph_objects as go
 import streamlit as st
+from dotenv import load_dotenv
 
 import config
 import db
 from matchbook_api import MatchbookAPI
 
+load_dotenv()
+
 # Bot considered offline if no snapshot in this many minutes
 BOT_OFFLINE_THRESHOLD_MIN = 5
+
+
+def _get_dashboard_password() -> Optional[str]:
+    """Return configured dashboard password, or None if auth disabled."""
+    pwd = os.getenv("DASHBOARD_PASSWORD", "").strip()
+    return pwd if pwd else None
+
+
+def _check_auth() -> bool:
+    """Return True if user is authenticated. Show login form if not."""
+    required = _get_dashboard_password()
+    if not required:
+        return True  # No password set, allow access
+
+    if st.session_state.get("dashboard_authenticated"):
+        return True
+
+    st.title("Matchbook Trading Dashboard")
+    st.markdown("Enter the dashboard password to continue.")
+    pwd = st.text_input("Password", type="password", key="dashboard_pwd")
+    if st.button("Log in", key="dashboard_login"):
+        if pwd == required:
+            st.session_state["dashboard_authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    return False
 
 
 def _run_async(coro):
@@ -99,10 +132,17 @@ def main():
     if "panic_in_progress" not in st.session_state:
         st.session_state["panic_in_progress"] = False
 
+    if not _check_auth():
+        st.stop()
+
     db.init_db()
 
     # Sidebar: bot on/off, paper trading, stop-loss, configurable refresh
     with st.sidebar:
+        if _get_dashboard_password():
+            if st.button("Log out", key="dashboard_logout"):
+                st.session_state.pop("dashboard_authenticated", None)
+                st.rerun()
         st.subheader("Bot Control")
         bot_enabled = db.get_bot_enabled()
         new_state = st.toggle("Trading enabled", value=bot_enabled, key="bot_toggle")
