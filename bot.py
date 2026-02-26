@@ -6,6 +6,7 @@ Implements Green Up formula, Lay liability check, and market suspension retry.
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 import config
@@ -156,6 +157,91 @@ def _get_sport_ids():
 def _get_market_types():
     """Market types from DB settings or config."""
     return db.get_market_types()
+
+
+def _parse_event_start(start_str: Optional[str]) -> Optional[datetime]:
+    """Parse ISO 8601 event start string to datetime (UTC)."""
+    if not start_str:
+        return None
+    try:
+        s = str(start_str).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+
+async def _close_events_before_start(api: MatchbookAPI) -> None:
+    """
+    When pre-match only: cancel open orders and hedge matched positions
+    for events starting within close_before_start_minutes.
+    """
+    if not db.get_pre_match_only():
+        return
+
+    offers = await api.get_offers(statuses=["open", "matched"])
+    if not offers:
+        return
+
+    event_ids = list({o.get("event-id") for o in offers if o.get("event-id")})
+    if not event_ids:
+        return
+
+    events = await api.get_events(
+        event_ids=event_ids,
+        include_prices=False,
+        pre_match_only=False,
+    )
+    close_minutes = db.get_close_before_start_minutes()
+    now = datetime.now(timezone.utc)
+    threshold = now.timestamp() + (close_minutes * 60)
+
+    events_to_close = []
+    for ev in events:
+        start = _parse_event_start(ev.get("start"))
+        if start and start.timestamp() <= threshold:
+            events_to_close.append(ev.get("id"))
+
+    if not events_to_close:
+        return
+
+    for event_id in events_to_close:
+        event_offers = [o for o in offers if o.get("event-id") == event_id]
+        if not event_offers:
+            continue
+
+        event_name = event_offers[0].get("event-name", event_id)
+        logger.info("Closing orders for event %s (starts within %d min)", event_name, int(close_minutes))
+
+        # Cancel all open offers for this event
+        if not db.get_paper_trading():
+            try:
+                await api.cancel_offers(event_ids=[event_id])
+                logger.info("Cancelled open offers for event %s", event_id)
+            except Exception as e:
+                logger.exception("Failed to cancel offers: %s", e)
+
+        # Hedge matched Back positions (Green Up)
+        for o in event_offers:
+            if o.get("status") != "matched" or o.get("side") != "back":
+                continue
+            back_stake = float(o.get("stake", 0) or o.get("remaining", 0))
+            back_odds = float(o.get("odds", 0) or o.get("decimal-odds", 0))
+            runner_id = o.get("runner-id")
+            if back_stake <= 0 or back_odds <= 0 or not runner_id:
+                continue
+            if not db.get_paper_trading():
+                await _hedge_with_retry(
+                    api,
+                    runner_id,
+                    back_stake,
+                    back_odds,
+                    o.get("market-name", ""),
+                    o.get("runner-name", ""),
+                )
+            await asyncio.sleep(config.RATE_LIMIT_DELAY_MS / 1000.0)
 
 
 async def _run_phase1(api: MatchbookAPI) -> None:
@@ -452,6 +538,9 @@ async def _main_loop() -> None:
         if not trading_enabled:
             logger.info("Bot is paused. Snapshot recorded, no orders placed.")
             return
+
+        # Pre-match only: close orders for events starting soon
+        await _close_events_before_start(api)
 
         # Daily stop-loss: pause if today's loss exceeds limit
         if db.get_stop_loss_triggered():

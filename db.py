@@ -553,6 +553,63 @@ def get_market_types() -> list[str]:
         conn.close()
 
 
+def get_close_before_start_minutes() -> float:
+    """Minutes before event start to close orders. From settings or config."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = 'close_before_start_minutes'"
+        ).fetchone()
+        if row and row[0]:
+            try:
+                return float(row[0])
+            except (ValueError, TypeError):
+                pass
+        return config.CLOSE_BEFORE_START_MINUTES
+    finally:
+        conn.close()
+
+
+def set_close_before_start_minutes(minutes: float) -> None:
+    """Set minutes before event start to close orders."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('close_before_start_minutes', ?)",
+            (str(minutes),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_pre_match_only() -> bool:
+    """Return True if bot should only trade pre-match (exclude in-play)."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = 'pre_match_only'"
+        ).fetchone()
+        if row and row[0] is not None:
+            return str(row[0]).lower() in ("1", "true", "yes")
+        return config.PRE_MATCH_ONLY
+    finally:
+        conn.close()
+
+
+def set_pre_match_only(enabled: bool) -> None:
+    """Enable or disable pre-match-only filter."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('pre_match_only', ?)",
+            ("1" if enabled else "0",),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def set_market_types(types: list[str]) -> None:
     """Store market types in settings."""
     conn = get_connection()

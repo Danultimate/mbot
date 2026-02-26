@@ -110,6 +110,27 @@ def main():
             st.success("Bot " + ("enabled" if new_state else "paused") + ". Changes apply on next cycle.")
             st.rerun()
 
+        pre_match_only = db.get_pre_match_only()
+        pre_match_state = st.toggle("Pre-match only (no in-play)", value=pre_match_only, key="pre_match_toggle")
+        if pre_match_state != pre_match_only:
+            db.set_pre_match_only(pre_match_state)
+            st.success("Pre-match only " + ("on" if pre_match_state else "off") + ".")
+            st.rerun()
+
+        close_before_min = db.get_close_before_start_minutes()
+        new_close_min = st.number_input(
+            "Close before start (minutes)",
+            min_value=1,
+            max_value=60,
+            value=int(close_before_min),
+            step=1,
+            key="close_before_start",
+            help="When pre-match only: close orders for events starting within this many minutes.",
+        )
+        if new_close_min != close_before_min:
+            db.set_close_before_start_minutes(float(new_close_min))
+            st.rerun()
+
         paper_trading = db.get_paper_trading()
         paper_state = st.toggle("Paper trading", value=paper_trading, key="paper_toggle")
         if paper_state != paper_trading:

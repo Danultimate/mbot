@@ -40,6 +40,13 @@ MAX_HEDGE_RETRIES = 30
 # Database path (override via DB_PATH env for Docker)
 DB_PATH = os.getenv("DB_PATH", "trading.db")
 
+# Pre-match only: exclude in-play/live events (volatile, fast-moving)
+# When True, only fetch events that start in the future
+PRE_MATCH_ONLY = True
+
+# When pre-match only: close all orders/positions this many minutes before event start
+CLOSE_BEFORE_START_MINUTES = 5
+
 # API base URLs
 API_BASE_BPAPI = "https://api.matchbook.com/bpapi/rest"
 API_BASE_EDGE = "https://api.matchbook.com/edge/rest"

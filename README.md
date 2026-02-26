@@ -48,6 +48,7 @@ docker compose up -d
 - **On/Off toggle**: Use the sidebar "Trading enabled" toggle to pause. When paused, the bot still records snapshots but places no orders.
 - **Daily stop-loss**: If today's loss exceeds `DAILY_STOP_LOSS_PCT` (default 10%) of start-of-day bankroll, trading pauses. Clear via sidebar to resume.
 - **Paper trading**: Toggle in sidebar. No real orders—bot runs logic and logs "would place" only. Safe for testing.
+- **Pre-match only**: Default on. Bot only trades events that haven't started (excludes in-play). Toggle in sidebar.
 
 ## Configuration
 

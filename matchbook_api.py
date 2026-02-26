@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import Any, Optional
 
 import aiohttp
@@ -211,16 +212,19 @@ class MatchbookAPI:
     async def get_events(
         self,
         sport_ids: Optional[list[int]] = None,
+        event_ids: Optional[list[int]] = None,
         include_prices: bool = True,
         price_depth: int = 3,
         states: str = "open",
         per_page: int = 20,
         offset: int = 0,
+        pre_match_only: Optional[bool] = None,
     ) -> list[dict]:
         """
         Fetch events with optional prices.
         GET edge/rest/events.
-        Filter by sport-ids for football (1) or political category-ids.
+        event_ids: fetch specific events by ID (skips pre_match filter).
+        pre_match_only: when True, only return events starting in the future (excludes in-play).
         """
         await self.ensure_auth()
         url = f"{config.API_BASE_EDGE}/events"
@@ -235,6 +239,11 @@ class MatchbookAPI:
         }
         if sport_ids:
             params["sport-ids"] = ",".join(str(s) for s in sport_ids)
+        if event_ids:
+            params["ids"] = ",".join(str(e) for e in event_ids)
+        # Only apply pre_match filter when not fetching by specific ids
+        if not event_ids and (pre_match_only if pre_match_only is not None else db.get_pre_match_only()):
+            params["after"] = int(time.time())
 
         try:
             status, body = await self._request_with_retry("GET", url, params=params)
