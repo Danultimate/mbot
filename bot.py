@@ -392,6 +392,24 @@ async def _main_loop() -> None:
             logger.info("Bot is paused. Snapshot recorded, no orders placed.")
             return
 
+        # Daily stop-loss: pause if today's loss exceeds limit
+        if db.get_stop_loss_triggered():
+            logger.warning("Daily stop-loss triggered. Trading paused until tomorrow or manual clear.")
+            return
+
+        start_balance = db.get_daily_start_balance()
+        stop_loss_pct = db.get_daily_stop_loss_pct()
+        if start_balance and start_balance > 0:
+            daily_loss_pct = ((start_balance - balance) / start_balance) * 100
+            if daily_loss_pct >= stop_loss_pct:
+                db.set_stop_loss_triggered()
+                logger.warning(
+                    "Daily stop-loss triggered: %.1f%% loss (limit %.1f%%). Trading paused.",
+                    daily_loss_pct,
+                    stop_loss_pct,
+                )
+                return
+
         phase = 2 if free_funds >= config.PHASE2_MIN_BANKROLL else 1
         logger.info("Bankroll: £%.2f, Phase: %d", free_funds, phase)
 

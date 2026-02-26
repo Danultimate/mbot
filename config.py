@@ -13,6 +13,9 @@ STARTING_BANKROLL = 25
 TARGET_BANKROLL = 5000
 DAILY_ROI_TARGET_PCT = 5.0
 
+# Daily stop-loss: pause trading if daily loss exceeds this % of start-of-day bankroll
+DAILY_STOP_LOSS_PCT = 10.0
+
 # Market focus: configurable for Football, Political, or both
 # Football sport-id is typically 1; political uses category-ids
 # See Matchbook API docs for sport-ids and category-ids

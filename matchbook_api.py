@@ -254,9 +254,14 @@ class MatchbookAPI:
         """
         Submit one or more offers (Back or Lay orders).
         POST edge/rest/v2/offers.
-        Each offer: runner-id, side, odds, stake, keep-in-play (optional).
-        Returns list of offer objects from response.
+        In paper trading mode: no-op, logs and returns empty list.
         """
+        if db.get_paper_trading():
+            logger.info("PAPER TRADING: Would submit %d offers", len(offers))
+            for o in offers:
+                logger.info("  PAPER: %s %s @ %.2f x %.2f", o.get("side"), o.get("runner-id"), o.get("odds"), o.get("stake"))
+            return []
+
         await self.ensure_auth()
         url = f"{config.API_BASE_EDGE}/v2/offers"
         payload = {
@@ -289,8 +294,12 @@ class MatchbookAPI:
         """
         Cancel open offers.
         DELETE edge/rest/v2/offers with optional filters.
-        If no filters, cancels all open offers.
+        In paper trading mode: no-op, logs and returns empty list.
         """
+        if db.get_paper_trading():
+            logger.info("PAPER TRADING: Would cancel offers (ids=%s)", offer_ids)
+            return []
+
         await self.ensure_auth()
         url = f"{config.API_BASE_EDGE}/v2/offers"
         params = {}

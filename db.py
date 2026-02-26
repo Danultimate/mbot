@@ -69,6 +69,7 @@ def init_db() -> None:
                 value TEXT
             );
             INSERT OR IGNORE INTO settings (key, value) VALUES ('bot_enabled', '1');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('paper_trading', '0');
 
             CREATE TABLE IF NOT EXISTS api_session (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -321,6 +322,114 @@ def clear_api_session() -> None:
     conn = get_connection()
     try:
         conn.execute("DELETE FROM api_session WHERE id = 1")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_daily_start_balance() -> Optional[float]:
+    """Return first balance of today from bankroll_snapshots, or None."""
+    conn = get_connection()
+    try:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        row = conn.execute(
+            """SELECT balance FROM bankroll_snapshots
+               WHERE date(timestamp) = date(?)
+               ORDER BY timestamp ASC LIMIT 1""",
+            (today,),
+        ).fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+    finally:
+        conn.close()
+
+
+def get_stop_loss_triggered() -> bool:
+    """True if daily stop-loss was triggered today."""
+    conn = get_connection()
+    try:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = 'stop_loss_triggered_date'"
+        ).fetchone()
+        return (row and row[0] == today) if row else False
+    finally:
+        conn.close()
+
+
+def set_stop_loss_triggered() -> None:
+    """Mark today as stop-loss triggered."""
+    conn = get_connection()
+    try:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('stop_loss_triggered_date', ?)",
+            (today,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_daily_stop_loss_pct() -> float:
+    """Return configured daily stop-loss % (from settings or config default)."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = 'daily_stop_loss_pct'"
+        ).fetchone()
+        if row and row[0]:
+            try:
+                return float(row[0])
+            except (ValueError, TypeError):
+                pass
+        return config.DAILY_STOP_LOSS_PCT
+    finally:
+        conn.close()
+
+
+def set_daily_stop_loss_pct(pct: float) -> None:
+    """Set daily stop-loss % in settings."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('daily_stop_loss_pct', ?)",
+            (str(pct),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_stop_loss() -> None:
+    """Clear stop-loss so trading can resume."""
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM settings WHERE key = 'stop_loss_triggered_date'")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_paper_trading() -> bool:
+    """Return True if paper trading mode is enabled."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = 'paper_trading'"
+        ).fetchone()
+        return (row and row[0] and str(row[0]).lower() in ("1", "true", "yes")) if row else False
+    finally:
+        conn.close()
+
+
+def set_paper_trading(enabled: bool) -> None:
+    """Enable or disable paper trading mode."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('paper_trading', ?)",
+            ("1" if enabled else "0",),
+        )
         conn.commit()
     finally:
         conn.close()

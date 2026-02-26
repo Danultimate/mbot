@@ -100,7 +100,7 @@ def main():
 
     db.init_db()
 
-    # Sidebar: bot on/off, configurable refresh, last bot cycle
+    # Sidebar: bot on/off, paper trading, stop-loss, configurable refresh
     with st.sidebar:
         st.subheader("Bot Control")
         bot_enabled = db.get_bot_enabled()
@@ -109,6 +109,34 @@ def main():
             db.set_bot_enabled(new_state)
             st.success("Bot " + ("enabled" if new_state else "paused") + ". Changes apply on next cycle.")
             st.rerun()
+
+        paper_trading = db.get_paper_trading()
+        paper_state = st.toggle("Paper trading", value=paper_trading, key="paper_toggle")
+        if paper_state != paper_trading:
+            db.set_paper_trading(paper_state)
+            st.success("Paper trading " + ("on" if paper_state else "off") + ".")
+            st.rerun()
+
+        stop_loss_pct = db.get_daily_stop_loss_pct()
+        new_stop_loss = st.slider(
+            "Daily stop-loss (%)",
+            min_value=1,
+            max_value=50,
+            value=int(stop_loss_pct),
+            step=1,
+            key="stop_loss_slider",
+        )
+        if new_stop_loss != stop_loss_pct:
+            db.set_daily_stop_loss_pct(float(new_stop_loss))
+            st.rerun()
+
+        stop_loss_triggered = db.get_stop_loss_triggered()
+        if stop_loss_triggered:
+            st.warning("Daily stop-loss triggered. Trading paused.")
+            if st.button("Clear stop-loss & resume", key="clear_stop_loss"):
+                db.clear_stop_loss()
+                st.success("Stop-loss cleared. Trading can resume.")
+                st.rerun()
 
         st.subheader("Settings")
         refresh_interval = st.slider(
@@ -163,7 +191,11 @@ def main():
         else:
             st.warning("Bot likely offline (no snapshots yet)")
     with status_col3:
-        if db.get_bot_enabled():
+        if db.get_stop_loss_triggered():
+            st.error("Stop-loss triggered")
+        elif db.get_paper_trading():
+            st.info("Paper trading")
+        elif db.get_bot_enabled():
             st.success("Bot: Trading")
         else:
             st.warning("Bot: Paused")
