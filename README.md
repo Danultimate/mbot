@@ -32,6 +32,16 @@ cp .env.example .env
 .venv/bin/streamlit run app.py
 ```
 
+## Docker Deployment
+
+```bash
+# Ensure .env exists with MATCHBOOK_USER and MATCHBOOK_PASSWORD
+docker compose up -d
+```
+
+- **Bot**: Runs every 60 seconds, shares SQLite DB with dashboard
+- **Dashboard**: http://localhost:8501
+
 ## Configuration
 
 Edit `config.py` to adjust:

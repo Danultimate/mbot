@@ -1,0 +1,25 @@
+services:
+  bot:
+    build: .
+    command: sh -c "while true; do python bot.py; sleep 60; done"
+    env_file: .env
+    volumes:
+      - bot_data:/app/data
+    environment:
+      - DB_PATH=/app/data/trading.db
+    restart: unless-stopped
+
+  dashboard:
+    build: .
+    command: streamlit run app.py --server.port=8501 --server.address=0.0.0.0
+    env_file: .env
+    ports:
+      - "8501:8501"
+    volumes:
+      - bot_data:/app/data
+    environment:
+      - DB_PATH=/app/data/trading.db
+    restart: unless-stopped
+
+volumes:
+  bot_data:

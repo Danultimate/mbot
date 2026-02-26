@@ -4,6 +4,8 @@ Configurable sport-ids, tick sizes, phase thresholds, and market types.
 Supports both Football and Political markets via SPORT_IDS / MARKET_TYPES.
 """
 
+import os
+
 # Phase thresholds (GBP)
 PHASE1_MAX_BANKROLL = 200
 PHASE2_MIN_BANKROLL = 200
@@ -32,8 +34,8 @@ RATE_LIMIT_DELAY_MS = 100
 HEDGE_RETRY_INTERVAL_SEC = 2
 MAX_HEDGE_RETRIES = 30
 
-# Database path
-DB_PATH = "trading.db"
+# Database path (override via DB_PATH env for Docker)
+DB_PATH = os.getenv("DB_PATH", "trading.db")
 
 # API base URLs
 API_BASE_BPAPI = "https://api.matchbook.com/bpapi/rest"
