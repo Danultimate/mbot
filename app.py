@@ -14,6 +14,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 
+import alerts
 import config
 import db
 from matchbook_api import MatchbookAPI
@@ -89,6 +90,7 @@ def _panic_hedge():
         api = MatchbookAPI()
         _run_async(_do_panic_hedge(api))
         _run_async(api.close())
+        alerts.send_alert("Panic hedge executed. Open offers cancelled and matched positions hedged.", "panic_hedge")
         st.success("Panic hedge executed. Open offers cancelled and matched positions hedged.")
     except Exception as e:
         st.error(f"Panic hedge failed: {e}")
@@ -223,6 +225,17 @@ def main():
                 f"£{example_gross:.0f} gross profit → £{example_net:.0f} net "
                 f"(after {int(db.get_commission_rate()*100)}% commission)"
             )
+
+        with st.expander("Alerts"):
+            channels = alerts.get_configured_channels()
+            for name, configured in channels.items():
+                st.caption(f"{name.capitalize()}: {'configured' if configured else 'not set'}")
+            if any(channels.values()):
+                if st.button("Test alert", key="test_alert"):
+                    alerts.send_alert("This is a test alert from the dashboard.", "test")
+                    st.success("Test alert sent to configured channels.")
+            else:
+                st.caption("Set ALERT_* env vars to enable. See .env.example.")
 
         st.subheader("Market / Sport")
         # Sport IDs: Matchbook uses various IDs - 1=Football common; verify via API /edge/rest/lookups/sports

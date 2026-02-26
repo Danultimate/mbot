@@ -6,9 +6,11 @@ Implements Green Up formula, Lay liability check, and market suspension retry.
 
 import asyncio
 import logging
+import traceback
 from datetime import datetime, timezone
 from typing import Optional
 
+import alerts
 import config
 import db
 from matchbook_api import MatchbookAPI, MarketSuspendedError
@@ -184,6 +186,11 @@ async def _hedge_with_retry(
         except Exception as e:
             logger.exception("Hedge failed: %s", e)
             await asyncio.sleep(config.HEDGE_RETRY_INTERVAL_SEC)
+    asyncio.to_thread(
+        alerts.send_alert,
+        f"Hedge failed for {runner_name} after {config.MAX_HEDGE_RETRIES} retries.",
+        "hedge_failed",
+    )
     return False, None
 
 
@@ -280,6 +287,11 @@ async def _hedge_lay_with_retry(
         except Exception as e:
             logger.exception("Lay hedge failed: %s", e)
             await asyncio.sleep(config.HEDGE_RETRY_INTERVAL_SEC)
+    asyncio.to_thread(
+        alerts.send_alert,
+        f"Lay hedge failed for {runner_name} after {config.MAX_HEDGE_RETRIES} retries.",
+        "hedge_failed",
+    )
     return False, None
 
 
@@ -715,11 +727,12 @@ async def _main_loop() -> None:
             daily_loss_pct = ((start_balance - balance) / start_balance) * 100
             if daily_loss_pct >= stop_loss_pct:
                 db.set_stop_loss_triggered()
-                logger.warning(
-                    "Daily stop-loss triggered: %.1f%% loss (limit %.1f%%). Trading paused.",
-                    daily_loss_pct,
-                    stop_loss_pct,
+                msg = (
+                    f"Daily stop-loss triggered: {daily_loss_pct:.1f}% loss "
+                    f"(limit {stop_loss_pct:.1f}%). Trading paused."
                 )
+                logger.warning("%s", msg)
+                asyncio.to_thread(alerts.send_alert, msg, "stop_loss")
                 return
 
         phase = 2 if free_funds >= config.PHASE2_MIN_BANKROLL else 1
@@ -739,7 +752,12 @@ async def _main_loop() -> None:
 
 def main() -> None:
     """Entry point for the bot."""
-    asyncio.run(_main_loop())
+    try:
+        asyncio.run(_main_loop())
+    except Exception as e:
+        msg = f"Bot error: {e}\n\n{traceback.format_exc()}"
+        alerts.send_alert(msg, "error")
+        raise
 
 
 if __name__ == "__main__":

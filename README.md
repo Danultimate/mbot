@@ -49,6 +49,7 @@ docker compose up -d
 - **Daily stop-loss**: If today's loss exceeds `DAILY_STOP_LOSS_PCT` (default 10%) of start-of-day bankroll, trading pauses. Clear via sidebar to resume.
 - **Paper trading**: Toggle in sidebar. No real orders—bot runs logic and logs "would place" only. Safe for testing.
 - **Pre-match only**: Default on. Bot only trades events that haven't started (excludes in-play). Toggle in sidebar.
+- **Alerts**: Optional Telegram, Discord, and/or email notifications for stop-loss, errors, hedge failures, and panic hedge. Configure via `ALERT_*` env vars (see `.env.example`).
 
 ## Configuration
 

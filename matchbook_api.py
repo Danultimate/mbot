@@ -14,6 +14,7 @@ from typing import Any, Optional
 import aiohttp
 from dotenv import load_dotenv
 
+import alerts
 import config
 import db
 
@@ -166,9 +167,14 @@ class MatchbookAPI:
                     raise MatchbookAPIError(resp.status, err_msg, body)
         except aiohttp.ClientError as e:
             logger.error("Network error during login: %s", e)
+            alerts.send_alert(f"Login failed (network): {e}", "auth_failure")
             raise
         except asyncio.TimeoutError:
             logger.error("Login timeout")
+            alerts.send_alert("Login failed: timeout", "auth_failure")
+            raise
+        except MatchbookAPIError as e:
+            alerts.send_alert(f"Login failed: {e}", "auth_failure")
             raise
 
     async def ensure_auth(self) -> None:
