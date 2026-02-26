@@ -148,6 +148,16 @@ async def _hedge_with_retry(
     return False
 
 
+def _get_sport_ids():
+    """Sport IDs from DB settings or config."""
+    return db.get_sport_ids()
+
+
+def _get_market_types():
+    """Market types from DB settings or config."""
+    return db.get_market_types()
+
+
 async def _run_phase1(api: MatchbookAPI) -> None:
     """
     Phase 1: Directional Scalping ("Buy the Dip").
@@ -155,8 +165,10 @@ async def _run_phase1(api: MatchbookAPI) -> None:
     On match: immediately Green Up with Lay order.
     """
     logger.info("Running Phase 1 (Scalping)")
+    sport_ids = _get_sport_ids()
+    market_types = _get_market_types()
     events = await api.get_events(
-        sport_ids=config.SPORT_IDS,
+        sport_ids=sport_ids,
         include_prices=True,
         price_depth=3,
         states="open",
@@ -167,7 +179,7 @@ async def _run_phase1(api: MatchbookAPI) -> None:
     candidates = []
     for event in events:
         for market in event.get("markets", []):
-            if market.get("market-type") not in config.MARKET_TYPES:
+            if market.get("market-type") not in market_types:
                 continue
             if market.get("status") != "open":
                 continue
@@ -196,46 +208,64 @@ async def _run_phase1(api: MatchbookAPI) -> None:
         stake = round(max_stake, 2)
 
         try:
-            offers = [
-                {
-                    "runner-id": runner["id"],
-                    "side": "back",
-                    "odds": back_odds,
-                    "stake": stake,
-                    "keep-in-play": False,
-                }
-            ]
-            result = await api.submit_offers(offers)
-            if result:
-                offer = result[0]
-                db.insert_trade(
-                    market_id=market.get("id"),
-                    runner_id=runner["id"],
+            if db.get_paper_trading():
+                db.insert_paper_trade(
+                    event_name=event.get("name", ""),
                     market_name=market.get("name", ""),
                     runner_name=runner.get("name", ""),
                     side="back",
                     odds=back_odds,
                     stake=stake,
-                    status=offer.get("status", "open"),
-                    offer_id=offer.get("id"),
                     phase=1,
-                )
-                db.insert_position(
-                    market_id=market.get("id"),
-                    runner_id=runner["id"],
-                    market_name=market.get("name", ""),
-                    runner_name=runner.get("name", ""),
-                    side="back",
-                    entry_odds=back_odds,
-                    entry_stake=stake,
-                    offer_id=offer.get("id"),
+                    reason="Phase 1: Back at discount (2 ticks above best)",
                 )
                 logger.info(
-                    "Phase 1 Back placed: %s @ %.2f x %.2f",
+                    "PAPER: Phase 1 Back would place: %s @ %.2f x %.2f",
                     runner.get("name"),
                     back_odds,
                     stake,
                 )
+            else:
+                offers = [
+                    {
+                        "runner-id": runner["id"],
+                        "side": "back",
+                        "odds": back_odds,
+                        "stake": stake,
+                        "keep-in-play": False,
+                    }
+                ]
+                result = await api.submit_offers(offers)
+                if result:
+                    offer = result[0]
+                    db.insert_trade(
+                        market_id=market.get("id"),
+                        runner_id=runner["id"],
+                        market_name=market.get("name", ""),
+                        runner_name=runner.get("name", ""),
+                        side="back",
+                        odds=back_odds,
+                        stake=stake,
+                        status=offer.get("status", "open"),
+                        offer_id=offer.get("id"),
+                        phase=1,
+                    )
+                    db.insert_position(
+                        market_id=market.get("id"),
+                        runner_id=runner["id"],
+                        market_name=market.get("name", ""),
+                        runner_name=runner.get("name", ""),
+                        side="back",
+                        entry_odds=back_odds,
+                        entry_stake=stake,
+                        offer_id=offer.get("id"),
+                    )
+                    logger.info(
+                        "Phase 1 Back placed: %s @ %.2f x %.2f",
+                        runner.get("name"),
+                        back_odds,
+                        stake,
+                    )
         except MarketSuspendedError:
             logger.warning("Market suspended, skipping")
         except Exception as e:
@@ -270,7 +300,7 @@ async def _run_phase1(api: MatchbookAPI) -> None:
 async def _fetch_lay_odds(api: MatchbookAPI, runner_id: int) -> Optional[float]:
     """Fetch current best Lay odds for a runner from events."""
     events = await api.get_events(
-        sport_ids=config.SPORT_IDS,
+        sport_ids=_get_sport_ids(),
         include_prices=True,
         price_depth=1,
         states="open",
@@ -294,9 +324,11 @@ async def _run_phase2(api: MatchbookAPI) -> None:
     logger.info("Running Phase 2 (Market Making)")
     account = api.get_account()
     free_funds = float(account.get("free-funds", 0) or 0)
+    sport_ids = _get_sport_ids()
+    market_types = _get_market_types()
 
     events = await api.get_events(
-        sport_ids=config.SPORT_IDS,
+        sport_ids=sport_ids,
         include_prices=True,
         price_depth=3,
         states="open",
@@ -305,7 +337,7 @@ async def _run_phase2(api: MatchbookAPI) -> None:
 
     for event in events:
         for market in event.get("markets", []):
-            if market.get("market-type") not in config.MARKET_TYPES:
+            if market.get("market-type") not in market_types:
                 continue
             if market.get("status") != "open":
                 continue
@@ -338,7 +370,36 @@ async def _run_phase2(api: MatchbookAPI) -> None:
                     continue
 
                 try:
-                    offers = [
+                    if db.get_paper_trading():
+                        db.insert_paper_trade(
+                            event_name=event.get("name", ""),
+                            market_name=market.get("name", ""),
+                            runner_name=runner.get("name", ""),
+                            side="back",
+                            odds=back_odds,
+                            stake=stake,
+                            phase=2,
+                            reason="Phase 2: Back at spread edge",
+                        )
+                        db.insert_paper_trade(
+                            event_name=event.get("name", ""),
+                            market_name=market.get("name", ""),
+                            runner_name=runner.get("name", ""),
+                            side="lay",
+                            odds=lay_odds,
+                            stake=stake,
+                            phase=2,
+                            reason="Phase 2: Lay at spread edge",
+                        )
+                        logger.info(
+                            "PAPER: Phase 2 would place Back %.2f Lay %.2f @ %.2f for %s",
+                            back_odds,
+                            lay_odds,
+                            stake,
+                            runner.get("name"),
+                        )
+                    else:
+                        offers = [
                         {
                             "runner-id": runner["id"],
                             "side": "back",
@@ -353,16 +414,16 @@ async def _run_phase2(api: MatchbookAPI) -> None:
                             "stake": stake,
                             "keep-in-play": False,
                         },
-                    ]
-                    result = await api.submit_offers(offers)
-                    if result:
-                        logger.info(
-                            "Phase 2 orders placed: %s Back %.2f Lay %.2f @ %.2f",
-                            runner.get("name"),
-                            back_odds,
-                            lay_odds,
-                            stake,
-                        )
+                        ]
+                        result = await api.submit_offers(offers)
+                        if result:
+                            logger.info(
+                                "Phase 2 orders placed: %s Back %.2f Lay %.2f @ %.2f",
+                                runner.get("name"),
+                                back_odds,
+                                lay_odds,
+                                stake,
+                            )
                 except MarketSuspendedError:
                     logger.warning("Market suspended")
                 except Exception as e:

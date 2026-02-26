@@ -138,6 +138,47 @@ def main():
                 st.success("Stop-loss cleared. Trading can resume.")
                 st.rerun()
 
+        st.subheader("Market / Sport")
+        # Sport IDs: Matchbook uses various IDs - 1=Football common; verify via API /edge/rest/lookups/sports
+        sport_options = {
+            "Football": [1],
+            "Tennis": [2],
+            "Horse Racing": [7],
+            "Politics": [6],
+        }
+        current_sports = db.get_sport_ids()
+        sport_labels = [k for k, v in sport_options.items() if any(x in current_sports for x in v)]
+        selected_sports = st.multiselect(
+            "Sports",
+            options=list(sport_options.keys()),
+            default=sport_labels if sport_labels else ["Football"],
+            key="sport_select",
+        )
+        sport_ids = []
+        for s in selected_sports:
+            sport_ids.extend(sport_options.get(s, []))
+        if set(sport_ids) != set(current_sports):
+            db.set_sport_ids(sport_ids if sport_ids else [1])
+            st.rerun()
+
+        market_options = {
+            "Match Odds": "one_x_two",
+            "Money Line": "money_line",
+            "Over/Under 2.5": "over_under_25",
+        }
+        current_markets = db.get_market_types()
+        market_labels = [k for k, v in market_options.items() if v in current_markets]
+        selected_markets = st.multiselect(
+            "Market types",
+            options=list(market_options.keys()),
+            default=market_labels if market_labels else ["Match Odds", "Over/Under 2.5"],
+            key="market_select",
+        )
+        market_types = [market_options[m] for m in selected_markets if m in market_options]
+        if set(market_types) != set(current_markets):
+            db.set_market_types(market_types if market_types else ["one_x_two"])
+            st.rerun()
+
         st.subheader("Settings")
         refresh_interval = st.slider(
             "Auto-refresh interval (seconds)",
@@ -322,6 +363,35 @@ def main():
         st.dataframe(trade_rows, use_container_width=True)
     else:
         st.info("No trades yet.")
+
+    # Paper trading activity (simulated orders when paper mode is on)
+    st.subheader("Paper Trading Activity")
+    if db.get_paper_trading():
+        paper_trades = db.get_paper_trades()
+        if paper_trades:
+            pt_rows = [
+                {
+                    "Time": (t.get("timestamp") or "")[:19],
+                    "Event": t.get("event_name", ""),
+                    "Market": t.get("market_name", ""),
+                    "Selection": t.get("runner_name", ""),
+                    "Side": (t.get("side") or "").capitalize(),
+                    "Odds": t.get("odds"),
+                    "Stake": t.get("stake"),
+                    "Phase": t.get("phase"),
+                    "Logic": t.get("reason", ""),
+                }
+                for t in paper_trades
+            ]
+            st.dataframe(pt_rows, use_container_width=True)
+            st.caption("Simulated orders the bot would have placed. No real money at risk.")
+            if st.button("Clear paper trade history", key="clear_paper"):
+                db.clear_paper_trades()
+                st.rerun()
+        else:
+            st.info("No paper trades yet. Enable paper trading and let the bot run a cycle.")
+    else:
+        st.caption("Enable paper trading in the sidebar to see simulated orders.")
 
     # Emergency control
     st.subheader("Emergency Control")

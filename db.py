@@ -78,9 +78,23 @@ def init_db() -> None:
                 updated_at TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS paper_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                event_name TEXT,
+                market_name TEXT,
+                runner_name TEXT,
+                side TEXT NOT NULL,
+                odds REAL NOT NULL,
+                stake REAL NOT NULL,
+                phase INTEGER,
+                reason TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
             CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
             CREATE INDEX IF NOT EXISTS idx_bankroll_timestamp ON bankroll_snapshots(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_paper_trades_timestamp ON paper_trades(timestamp);
         """)
         conn.commit()
     finally:
@@ -429,6 +443,123 @@ def set_paper_trading(enabled: bool) -> None:
         conn.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES ('paper_trading', ?)",
             ("1" if enabled else "0",),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def insert_paper_trade(
+    event_name: str,
+    market_name: str,
+    runner_name: str,
+    side: str,
+    odds: float,
+    stake: float,
+    phase: int,
+    reason: str = "",
+) -> int:
+    """Insert a paper trade (simulated order). Returns row id."""
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            """INSERT INTO paper_trades (timestamp, event_name, market_name, runner_name,
+               side, odds, stake, phase, reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                datetime.utcnow().isoformat(),
+                event_name or "",
+                market_name or "",
+                runner_name or "",
+                side,
+                odds,
+                stake,
+                phase,
+                reason or "",
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def clear_paper_trades() -> None:
+    """Clear all paper trades (for testing)."""
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM paper_trades")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_paper_trades(limit: int = 50) -> list[dict]:
+    """Return recent paper trades for display."""
+    conn = get_connection()
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT timestamp, event_name, market_name, runner_name, side, odds, stake, phase, reason
+               FROM paper_trades ORDER BY timestamp DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_sport_ids() -> list[int]:
+    """Return sport IDs from settings, or config default."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = 'sport_ids'"
+        ).fetchone()
+        if row and row[0]:
+            try:
+                return [int(x.strip()) for x in str(row[0]).split(",") if x.strip()]
+            except (ValueError, TypeError):
+                pass
+        return config.SPORT_IDS
+    finally:
+        conn.close()
+
+
+def set_sport_ids(ids: list[int]) -> None:
+    """Store sport IDs in settings."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('sport_ids', ?)",
+            (",".join(str(i) for i in ids),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_market_types() -> list[str]:
+    """Return market types from settings, or config default."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = 'market_types'"
+        ).fetchone()
+        if row and row[0]:
+            return [x.strip() for x in str(row[0]).split(",") if x.strip()]
+        return config.MARKET_TYPES
+    finally:
+        conn.close()
+
+
+def set_market_types(types: list[str]) -> None:
+    """Store market types in settings."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('market_types', ?)",
+            (",".join(types),),
         )
         conn.commit()
     finally:
