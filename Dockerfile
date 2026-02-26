@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY config.py db.py matchbook_api.py bot.py app.py ./
+COPY config.py db.py matchbook_api.py bot.py app.py alerts.py ./
 
 EXPOSE 8501
 
