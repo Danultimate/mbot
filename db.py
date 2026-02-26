@@ -246,6 +246,20 @@ def get_current_bankroll() -> Optional[tuple[float, float, float]]:
         conn.close()
 
 
+def get_position_by_offer_id(offer_id: int) -> Optional[dict]:
+    """Return position dict for given offer_id, or None."""
+    conn = get_connection()
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT id, market_id, runner_id, market_name, runner_name, side, entry_odds, entry_stake, offer_id FROM positions WHERE offer_id = ?",
+            (offer_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
 def get_open_positions() -> list[dict]:
     """Return list of open positions as dicts."""
     conn = get_connection()

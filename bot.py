@@ -45,6 +45,34 @@ def _green_up_lay_stake(back_stake: float, back_odds: float, lay_odds: float) ->
     return round((back_stake * back_odds) / lay_odds, 2)
 
 
+def _green_up_back_stake(lay_stake: float, lay_odds: float, back_odds: float) -> float:
+    """
+    Compute the Back stake required to Green Up a Lay position.
+    Formula: Back Stake = (Lay Stake * Lay Odds) / Back Odds
+    """
+    if back_odds <= 0:
+        return 0.0
+    return round((lay_stake * lay_odds) / back_odds, 2)
+
+
+def _locked_in_profit_back_hedge(
+    back_stake: float, back_odds: float, lay_odds: float
+) -> float:
+    """Locked-in profit when hedging a Back with Lay. Rounded to 2 dp."""
+    if lay_odds <= 0:
+        return 0.0
+    return round(back_stake * (back_odds / lay_odds - 1), 2)
+
+
+def _locked_in_profit_lay_hedge(
+    lay_stake: float, lay_odds: float, back_odds: float
+) -> float:
+    """Locked-in profit when hedging a Lay with Back. Rounded to 2 dp."""
+    if back_odds <= 0:
+        return 0.0
+    return round(lay_stake * (back_odds - lay_odds) / back_odds, 2)
+
+
 def _lay_liability(lay_stake: float, lay_odds: float) -> float:
     """
     Compute Lay liability. Must be <= free_funds before placing Lay.
@@ -88,10 +116,12 @@ async def _hedge_with_retry(
     back_odds: float,
     market_name: str,
     runner_name: str,
-) -> bool:
+    market_id: int = 0,
+    back_offer_id: Optional[int] = None,
+) -> tuple[bool, Optional[float]]:
     """
     Place Green Up Lay order, retrying on Market Suspended every 2 seconds.
-    Recalculates lay_odds from live prices on each retry to cut losses if market moved.
+    Returns (success, locked_in_profit). Recalculates lay_odds from live prices on each retry.
     """
     for attempt in range(config.MAX_HEDGE_RETRIES):
         try:
@@ -104,7 +134,7 @@ async def _hedge_with_retry(
             lay_stake = _green_up_lay_stake(back_stake, back_odds, lay_odds)
             if lay_stake <= 0:
                 logger.warning("Invalid green up stake")
-                return False
+                return False, None
 
             offers = [
                 {
@@ -117,25 +147,32 @@ async def _hedge_with_retry(
             ]
             result = await api.submit_offers(offers)
             if result and result[0].get("status") in ("open", "matched"):
+                profit = _locked_in_profit_back_hedge(back_stake, back_odds, lay_odds)
                 logger.info(
-                    "Hedge placed: Lay %.2f @ %.2f (Green Up) for %s",
+                    "Hedge placed: Lay %.2f @ %.2f (Green Up) for %s, profit £%.2f",
                     lay_stake,
                     lay_odds,
                     runner_name,
+                    profit,
                 )
-                db.insert_trade(
-                    market_id=0,
-                    runner_id=runner_id,
-                    market_name=market_name,
-                    runner_name=runner_name,
-                    side="lay",
-                    odds=lay_odds,
-                    stake=lay_stake,
-                    status=result[0].get("status", "open"),
-                    offer_id=result[0].get("id"),
-                    phase=1,
-                )
-                return True
+                if not db.get_paper_trading():
+                    db.insert_trade(
+                        market_id=market_id,
+                        runner_id=runner_id,
+                        market_name=market_name,
+                        runner_name=runner_name,
+                        side="lay",
+                        odds=lay_odds,
+                        stake=lay_stake,
+                        status=result[0].get("status", "open"),
+                        offer_id=result[0].get("id"),
+                        phase=1,
+                        profit_loss=profit,
+                    )
+                    pos = db.get_position_by_offer_id(back_offer_id) if back_offer_id else None
+                    if pos:
+                        db.update_position(pos["id"], "closed", profit)
+                return True, profit
         except MarketSuspendedError:
             logger.warning(
                 "Market suspended during hedge (attempt %d/%d), retrying in %ds",
@@ -147,7 +184,103 @@ async def _hedge_with_retry(
         except Exception as e:
             logger.exception("Hedge failed: %s", e)
             await asyncio.sleep(config.HEDGE_RETRY_INTERVAL_SEC)
-    return False
+    return False, None
+
+
+async def _fetch_back_odds(api: MatchbookAPI, runner_id: int) -> Optional[float]:
+    """Fetch current best Back odds for a runner from events."""
+    events = await api.get_events(
+        sport_ids=_get_sport_ids(),
+        include_prices=True,
+        price_depth=1,
+        states="open",
+        per_page=100,
+    )
+    for event in events:
+        for market in event.get("markets", []):
+            for runner in market.get("runners", []):
+                if runner.get("id") == runner_id:
+                    best_back, _ = _get_best_back_lay(runner.get("prices", []))
+                    return best_back
+    return None
+
+
+async def _hedge_lay_with_retry(
+    api: MatchbookAPI,
+    runner_id: int,
+    lay_stake: float,
+    lay_odds: float,
+    market_name: str,
+    runner_name: str,
+    market_id: int = 0,
+    lay_offer_id: Optional[int] = None,
+) -> tuple[bool, Optional[float]]:
+    """
+    Place Green Up Back order to close a Lay position.
+    Returns (success, locked_in_profit).
+    """
+    for attempt in range(config.MAX_HEDGE_RETRIES):
+        try:
+            back_odds = await _fetch_back_odds(api, runner_id)
+            if back_odds is None or back_odds <= 0:
+                logger.warning("No valid back odds for Lay hedge, retrying...")
+                await asyncio.sleep(config.HEDGE_RETRY_INTERVAL_SEC)
+                continue
+
+            back_stake = _green_up_back_stake(lay_stake, lay_odds, back_odds)
+            if back_stake <= 0:
+                logger.warning("Invalid green up back stake")
+                return False, None
+
+            offers = [
+                {
+                    "runner-id": runner_id,
+                    "side": "back",
+                    "odds": _round_odds(back_odds),
+                    "stake": back_stake,
+                    "keep-in-play": False,
+                }
+            ]
+            result = await api.submit_offers(offers)
+            if result and result[0].get("status") in ("open", "matched"):
+                profit = _locked_in_profit_lay_hedge(lay_stake, lay_odds, back_odds)
+                logger.info(
+                    "Lay hedge placed: Back %.2f @ %.2f (Green Up) for %s, profit £%.2f",
+                    back_stake,
+                    back_odds,
+                    runner_name,
+                    profit,
+                )
+                if not db.get_paper_trading():
+                    db.insert_trade(
+                        market_id=market_id,
+                        runner_id=runner_id,
+                        market_name=market_name,
+                        runner_name=runner_name,
+                        side="back",
+                        odds=back_odds,
+                        stake=back_stake,
+                        status=result[0].get("status", "open"),
+                        offer_id=result[0].get("id"),
+                        phase=1,
+                        profit_loss=profit,
+                    )
+                    pos = db.get_position_by_offer_id(lay_offer_id) if lay_offer_id else None
+                    if pos:
+                        db.update_position(pos["id"], "closed", profit)
+                return True, profit
+        except MarketSuspendedError:
+            logger.warning(
+                "Market suspended during Lay hedge (attempt %d/%d), retrying in %ds",
+                attempt + 1,
+                config.MAX_HEDGE_RETRIES,
+                config.HEDGE_RETRY_INTERVAL_SEC,
+            )
+            await asyncio.sleep(config.HEDGE_RETRY_INTERVAL_SEC)
+        except Exception as e:
+            logger.exception("Lay hedge failed: %s", e)
+            await asyncio.sleep(config.HEDGE_RETRY_INTERVAL_SEC)
+    return False, None
 
 
 def _get_sport_ids():
@@ -224,24 +357,30 @@ async def _close_events_before_start(api: MatchbookAPI) -> None:
             except Exception as e:
                 logger.exception("Failed to cancel offers: %s", e)
 
-        # Hedge matched Back positions (Green Up)
+        # Hedge matched positions (Back with Lay, Lay with Back)
         for o in event_offers:
-            if o.get("status") != "matched" or o.get("side") != "back":
+            if o.get("status") != "matched":
                 continue
-            back_stake = float(o.get("stake", 0) or o.get("remaining", 0))
-            back_odds = float(o.get("odds", 0) or o.get("decimal-odds", 0))
             runner_id = o.get("runner-id")
-            if back_stake <= 0 or back_odds <= 0 or not runner_id:
+            stake = float(o.get("stake", 0) or o.get("remaining", 0))
+            odds = float(o.get("odds", 0) or o.get("decimal-odds", 0))
+            if stake <= 0 or odds <= 0 or not runner_id:
                 continue
-            if not db.get_paper_trading():
-                await _hedge_with_retry(
-                    api,
-                    runner_id,
-                    back_stake,
-                    back_odds,
-                    o.get("market-name", ""),
-                    o.get("runner-name", ""),
-                )
+            market_id = o.get("market-id") or 0
+            if o.get("side") == "back":
+                if not db.get_paper_trading():
+                    await _hedge_with_retry(
+                        api, runner_id, stake, odds,
+                        o.get("market-name", ""), o.get("runner-name", ""),
+                        market_id=market_id, back_offer_id=o.get("id"),
+                    )
+            elif o.get("side") == "lay":
+                if not db.get_paper_trading():
+                    await _hedge_lay_with_retry(
+                        api, runner_id, stake, odds,
+                        o.get("market-name", ""), o.get("runner-name", ""),
+                        market_id=market_id, lay_offer_id=o.get("id"),
+                    )
             await asyncio.sleep(config.RATE_LIMIT_DELAY_MS / 1000.0)
 
 
@@ -361,27 +500,49 @@ async def _run_phase1(api: MatchbookAPI) -> None:
         await asyncio.sleep(config.RATE_LIMIT_DELAY_MS / 1000.0)
 
     # Poll for matched offers and hedge (Green Up)
-    open_offers = await api.get_offers(statuses=["open", "matched"])
-    for offer in open_offers:
-        if offer.get("side") != "back":
+    await hedge_all_matched_positions(api)
+
+
+async def hedge_all_matched_positions(
+    api: MatchbookAPI, hedge_all: bool = False
+) -> None:
+    """
+    Fetch matched offers and hedge each (Back with Lay, Lay with Back).
+    hedge_all=True: process all matched (panic hedge). False: one per call (bot cycle).
+    """
+    offers = await api.get_offers(statuses=["open", "matched"])
+    count = 0
+    for offer in offers:
+        if offer.get("status") != "matched":
             continue
-        if offer.get("status") == "matched":
-            back_stake = float(offer.get("stake", 0) or offer.get("remaining", 0))
-            back_odds = float(offer.get("odds", 0) or offer.get("decimal-odds", 0))
-            runner_id = offer.get("runner-id")
-            market_name = offer.get("market-name", "")
-            runner_name = offer.get("runner-name", "")
-            if back_stake <= 0 or back_odds <= 0:
-                continue
-            await _hedge_with_retry(
-                api,
-                runner_id,
-                back_stake,
-                back_odds,
-                market_name,
-                runner_name,
-            )
-            break  # Process one at a time
+        runner_id = offer.get("runner-id")
+        stake = float(offer.get("stake", 0) or offer.get("remaining", 0))
+        odds = float(offer.get("odds", 0) or offer.get("decimal-odds", 0))
+        if stake <= 0 or odds <= 0 or not runner_id:
+            continue
+        market_id = offer.get("market-id") or 0
+        market_name = offer.get("market-name", "")
+        runner_name = offer.get("runner-name", "")
+        if offer.get("side") == "back":
+            if not db.get_paper_trading():
+                await _hedge_with_retry(
+                    api, runner_id, stake, odds,
+                    market_name, runner_name,
+                    market_id=market_id, back_offer_id=offer.get("id"),
+                )
+        elif offer.get("side") == "lay":
+            if not db.get_paper_trading():
+                await _hedge_lay_with_retry(
+                    api, runner_id, stake, odds,
+                    market_name, runner_name,
+                    market_id=market_id, lay_offer_id=offer.get("id"),
+                )
+        count += 1
+        await asyncio.sleep(config.RATE_LIMIT_DELAY_MS / 1000.0)
+        if not hedge_all:
+            break  # One per bot cycle
+    if hedge_all and count > 0:
+        logger.info("Panic hedge: closed %d matched position(s)", count)
 
 
 async def _fetch_lay_odds(api: MatchbookAPI, runner_id: int) -> Optional[float]:
@@ -568,6 +729,9 @@ async def _main_loop() -> None:
             await _run_phase1(api)
         else:
             await _run_phase2(api)
+
+        # Hedge any matched positions (Back or Lay) from this or previous cycles
+        await hedge_all_matched_positions(api)
 
     finally:
         await api.close()

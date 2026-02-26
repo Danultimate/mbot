@@ -56,7 +56,7 @@ def _panic_hedge():
         api = MatchbookAPI()
         _run_async(_do_panic_hedge(api))
         _run_async(api.close())
-        st.success("Panic hedge executed. All open offers cancelled.")
+        st.success("Panic hedge executed. Open offers cancelled and matched positions hedged.")
     except Exception as e:
         st.error(f"Panic hedge failed: {e}")
     finally:
@@ -64,11 +64,12 @@ def _panic_hedge():
 
 
 async def _do_panic_hedge(api: MatchbookAPI):
-    """Cancel all open offers. Optionally place market orders to close exposure."""
+    """Cancel all open offers and Green Up all matched positions."""
     await api.ensure_auth()
-    await api.cancel_offers()  # No filters = cancel all
-    # Positions with exposure would need Green Up - for simplicity we cancel only.
-    # Full implementation would fetch open positions and place hedge orders.
+    await api.cancel_offers()  # No filters = cancel all open
+    # Hedge all matched positions (Back with Lay, Lay with Back)
+    from bot import hedge_all_matched_positions
+    await hedge_all_matched_positions(api, hedge_all=True)
 
 
 def _cancel_offer(offer_id: int):
