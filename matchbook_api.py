@@ -1,7 +1,7 @@
 """
 Asynchronous Matchbook Exchange API wrapper.
 Handles authentication (session tokens, expiry), market data, and order execution.
-Loads credentials from .env via python-dotenv.
+Session is persisted to DB - login only when token expired (401) or missing.
 """
 
 import asyncio
@@ -14,6 +14,7 @@ import aiohttp
 from dotenv import load_dotenv
 
 import config
+import db
 
 load_dotenv()
 
@@ -48,6 +49,43 @@ class MatchbookAPI:
         self._session: Optional[aiohttp.ClientSession] = None
         self._rate_limit_delay = config.RATE_LIMIT_DELAY_MS / 1000.0
         self._timeout = aiohttp.ClientTimeout(total=config.API_TIMEOUT_SEC)
+        self._load_persisted_session()
+
+    def _load_persisted_session(self) -> None:
+        """Load session token and account from DB if available."""
+        try:
+            row = db.get_api_session()
+            if row:
+                token, account_json = row
+                if token:
+                    self._session_token = token
+                    if account_json:
+                        try:
+                            self._account = json.loads(account_json)
+                        except json.JSONDecodeError:
+                            pass
+        except Exception as e:
+            logger.debug("Could not load persisted session: %s", e)
+
+    def _save_session(self) -> None:
+        """Persist session to DB for reuse across requests/cycles."""
+        try:
+            if self._session_token and self._account is not None:
+                db.set_api_session(
+                    self._session_token,
+                    json.dumps(self._account) if self._account else "{}",
+                )
+        except Exception as e:
+            logger.debug("Could not persist session: %s", e)
+
+    def _clear_session(self) -> None:
+        """Clear in-memory and persisted session."""
+        self._session_token = None
+        self._account = None
+        try:
+            db.clear_api_session()
+        except Exception:
+            pass
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         """Create or return existing aiohttp session."""
@@ -85,6 +123,7 @@ class MatchbookAPI:
         Login to Matchbook and obtain session token.
         POST to bpapi/rest/security/session with username/password.
         Response includes session-token and account (balance, exposure, free-funds).
+        Persists session to DB for reuse - only needed when token expired or missing.
         """
         username = os.getenv("MATCHBOOK_USER")
         password = os.getenv("MATCHBOOK_PASSWORD")
@@ -107,11 +146,11 @@ class MatchbookAPI:
                 if resp.status == 200:
                     data = json.loads(body) if body else {}
                     self._session_token = data.get("session-token")
-                    # Account info: balance, exposure, free-funds
                     self._account = data.get("account", {})
                     if not self._session_token:
                         raise MatchbookAPIError(200, "No session-token in response", body)
-                    logger.info("Login successful")
+                    self._save_session()
+                    logger.info("Login successful (session persisted)")
                     return data
                 else:
                     await self._check_suspended(resp.status, body)
@@ -131,32 +170,34 @@ class MatchbookAPI:
             logger.error("Login timeout")
             raise
 
-    async def get_session(self) -> bool:
-        """
-        Validate session token. GET bpapi/rest/security/session.
-        Returns True if valid, False if expired (401).
-        """
-        if not self._session_token:
-            return False
-        session = await self._ensure_session()
-        url = f"{config.API_BASE_BPAPI}/security/session"
-        try:
-            async with session.get(url, headers=self._auth_headers()) as resp:
-                await self._rate_limit()
-                if resp.status == 200:
-                    return True
-                if resp.status == 401:
-                    self._session_token = None
-                    self._account = None
-                    return False
-                return False
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            return False
-
     async def ensure_auth(self) -> None:
-        """Ensure we have a valid session; re-login if expired."""
-        if not self._session_token or not await self.get_session():
+        """Ensure we have a session. Only login if token missing (session expired)."""
+        if not self._session_token:
             await self.login()
+
+    async def _request_with_retry(
+        self, method: str, url: str, retry_on_401: bool = True, **kwargs
+    ) -> tuple[int, str]:
+        """
+        Make HTTP request. On 401, clear session, login, retry once.
+        Returns (status_code, body).
+        """
+        session = await self._ensure_session()
+        async with session.request(
+            method, url, headers=self._auth_headers(), **kwargs
+        ) as resp:
+            body = await resp.text()
+            await self._rate_limit()
+            if resp.status == 401 and retry_on_401 and self._session_token:
+                self._clear_session()
+                await self.login()
+                async with session.request(
+                    method, url, headers=self._auth_headers(), **kwargs
+                ) as retry_resp:
+                    retry_body = await retry_resp.text()
+                    await self._rate_limit()
+                    return retry_resp.status, retry_body
+            return resp.status, body
 
     def get_account(self) -> dict:
         """
@@ -182,7 +223,6 @@ class MatchbookAPI:
         Filter by sport-ids for football (1) or political category-ids.
         """
         await self.ensure_auth()
-        session = await self._ensure_session()
         url = f"{config.API_BASE_EDGE}/events"
         params = {
             "include-prices": str(include_prices).lower(),
@@ -197,16 +237,12 @@ class MatchbookAPI:
             params["sport-ids"] = ",".join(str(s) for s in sport_ids)
 
         try:
-            async with session.get(url, params=params, headers=self._auth_headers()) as resp:
-                body = await resp.text()
-                await self._rate_limit()
-                await self._check_suspended(resp.status, body)
-
-                if resp.status != 200:
-                    raise MatchbookAPIError(resp.status, f"get_events failed: {body[:200]}", body)
-
-                data = json.loads(body) if body else {}
-                return data.get("events", [])
+            status, body = await self._request_with_retry("GET", url, params=params)
+            await self._check_suspended(status, body)
+            if status != 200:
+                raise MatchbookAPIError(status, f"get_events failed: {body[:200]}", body)
+            data = json.loads(body) if body else {}
+            return data.get("events", [])
         except aiohttp.ClientError as e:
             logger.error("get_events network error: %s", e)
             raise
@@ -222,7 +258,6 @@ class MatchbookAPI:
         Returns list of offer objects from response.
         """
         await self.ensure_auth()
-        session = await self._ensure_session()
         url = f"{config.API_BASE_EDGE}/v2/offers"
         payload = {
             "odds-type": "DECIMAL",
@@ -231,17 +266,13 @@ class MatchbookAPI:
         }
 
         try:
-            async with session.post(url, json=payload, headers=self._auth_headers()) as resp:
-                body = await resp.text()
-                await self._rate_limit()
-                await self._check_suspended(resp.status, body)
-
-                if resp.status != 200:
-                    err_msg = body[:500] if body else "Unknown error"
-                    raise MatchbookAPIError(resp.status, f"submit_offers failed: {err_msg}", body)
-
-                data = json.loads(body) if body else {}
-                return data.get("offers", [])
+            status, body = await self._request_with_retry("POST", url, json=payload)
+            await self._check_suspended(status, body)
+            if status != 200:
+                err_msg = body[:500] if body else "Unknown error"
+                raise MatchbookAPIError(status, f"submit_offers failed: {err_msg}", body)
+            data = json.loads(body) if body else {}
+            return data.get("offers", [])
         except aiohttp.ClientError as e:
             logger.error("submit_offers network error: %s", e)
             raise
@@ -261,7 +292,6 @@ class MatchbookAPI:
         If no filters, cancels all open offers.
         """
         await self.ensure_auth()
-        session = await self._ensure_session()
         url = f"{config.API_BASE_EDGE}/v2/offers"
         params = {}
         if offer_ids:
@@ -272,20 +302,16 @@ class MatchbookAPI:
             params["event-ids"] = ",".join(str(e) for e in event_ids)
 
         try:
-            async with session.delete(url, params=params, headers=self._auth_headers()) as resp:
-                body = await resp.text()
-                await self._rate_limit()
-                await self._check_suspended(resp.status, body)
-
-                if resp.status not in (200, 204):
-                    raise MatchbookAPIError(
-                        resp.status, f"cancel_offers failed: {body[:200]}", body
-                    )
-
-                if body:
-                    data = json.loads(body)
-                    return data.get("offers", [])
-                return []
+            status, body = await self._request_with_retry("DELETE", url, params=params)
+            await self._check_suspended(status, body)
+            if status not in (200, 204):
+                raise MatchbookAPIError(
+                    status, f"cancel_offers failed: {body[:200]}", body
+                )
+            if body:
+                data = json.loads(body)
+                return data.get("offers", [])
+            return []
         except aiohttp.ClientError as e:
             logger.error("cancel_offers network error: %s", e)
             raise
@@ -303,7 +329,6 @@ class MatchbookAPI:
         GET edge/rest/v2/offers.
         """
         await self.ensure_auth()
-        session = await self._ensure_session()
         url = f"{config.API_BASE_EDGE}/v2/offers"
         params = {}
         if offer_ids:
@@ -312,16 +337,12 @@ class MatchbookAPI:
             params["statuses"] = ",".join(statuses)
 
         try:
-            async with session.get(url, params=params, headers=self._auth_headers()) as resp:
-                body = await resp.text()
-                await self._rate_limit()
-                await self._check_suspended(resp.status, body)
-
-                if resp.status != 200:
-                    raise MatchbookAPIError(resp.status, f"get_offers failed: {body[:200]}", body)
-
-                data = json.loads(body) if body else {}
-                return data.get("offers", [])
+            status, body = await self._request_with_retry("GET", url, params=params)
+            await self._check_suspended(status, body)
+            if status != 200:
+                raise MatchbookAPIError(status, f"get_offers failed: {body[:200]}", body)
+            data = json.loads(body) if body else {}
+            return data.get("offers", [])
         except aiohttp.ClientError as e:
             logger.error("get_offers network error: %s", e)
             raise

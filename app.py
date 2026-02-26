@@ -35,8 +35,8 @@ def _get_live_data():
 
 
 async def _fetch_live(api: MatchbookAPI):
-    """Async fetch of account and offers."""
-    await api.login()
+    """Async fetch of account and offers. Uses persisted session if valid."""
+    await api.ensure_auth()
     account = api.get_account()
     offers = await api.get_offers(statuses=["open", "matched"])
     return {
@@ -65,7 +65,7 @@ def _panic_hedge():
 
 async def _do_panic_hedge(api: MatchbookAPI):
     """Cancel all open offers. Optionally place market orders to close exposure."""
-    await api.login()
+    await api.ensure_auth()
     await api.cancel_offers()  # No filters = cancel all
     # Positions with exposure would need Green Up - for simplicity we cancel only.
     # Full implementation would fetch open positions and place hedge orders.
@@ -84,7 +84,7 @@ def _cancel_offer(offer_id: int):
 
 async def _do_cancel_offer(api: MatchbookAPI, offer_id: int):
     """Cancel a single offer."""
-    await api.login()
+    await api.ensure_auth()
     await api.cancel_offers(offer_ids=[offer_id])
 
 
@@ -100,8 +100,16 @@ def main():
 
     db.init_db()
 
-    # Sidebar: configurable refresh + last bot cycle
+    # Sidebar: bot on/off, configurable refresh, last bot cycle
     with st.sidebar:
+        st.subheader("Bot Control")
+        bot_enabled = db.get_bot_enabled()
+        new_state = st.toggle("Trading enabled", value=bot_enabled, key="bot_toggle")
+        if new_state != bot_enabled:
+            db.set_bot_enabled(new_state)
+            st.success("Bot " + ("enabled" if new_state else "paused") + ". Changes apply on next cycle.")
+            st.rerun()
+
         st.subheader("Settings")
         refresh_interval = st.slider(
             "Auto-refresh interval (seconds)",
@@ -135,7 +143,7 @@ def main():
     st.title("Matchbook Automated Trading System")
 
     # Status bar: Connection + Bot status + Manual refresh
-    status_col1, status_col2, status_col3 = st.columns([2, 2, 1])
+    status_col1, status_col2, status_col3, status_col4 = st.columns([2, 2, 1, 1])
     with status_col1:
         live, api_error = _get_live_data()
         if live:
@@ -155,6 +163,11 @@ def main():
         else:
             st.warning("Bot likely offline (no snapshots yet)")
     with status_col3:
+        if db.get_bot_enabled():
+            st.success("Bot: Trading")
+        else:
+            st.warning("Bot: Paused")
+    with status_col4:
         if st.button("Refresh", key="refresh_btn"):
             st.rerun()
 

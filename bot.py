@@ -375,10 +375,11 @@ async def _run_phase2(api: MatchbookAPI) -> None:
 async def _main_loop() -> None:
     """Main bot loop: snapshot bankroll, run phase logic, rate limit."""
     db.init_db()
-    api = MatchbookAPI()
+    trading_enabled = db.get_bot_enabled()
 
+    api = MatchbookAPI()
     try:
-        await api.login()
+        await api.ensure_auth()
         account = api.get_account()
         balance = float(account.get("balance", 0) or 0)
         exposure = float(account.get("exposure", 0) or 0)
@@ -386,6 +387,10 @@ async def _main_loop() -> None:
 
         daily_roi = db.get_daily_roi_pct()
         db.insert_bankroll_snapshot(balance, exposure, free_funds, daily_roi)
+
+        if not trading_enabled:
+            logger.info("Bot is paused. Snapshot recorded, no orders placed.")
+            return
 
         phase = 2 if free_funds >= config.PHASE2_MIN_BANKROLL else 1
         logger.info("Bankroll: £%.2f, Phase: %d", free_funds, phase)

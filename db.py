@@ -64,6 +64,19 @@ def init_db() -> None:
                 daily_roi_pct REAL
             );
 
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('bot_enabled', '1');
+
+            CREATE TABLE IF NOT EXISTS api_session (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                session_token TEXT,
+                account_json TEXT,
+                updated_at TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
             CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
             CREATE INDEX IF NOT EXISTS idx_bankroll_timestamp ON bankroll_snapshots(timestamp);
@@ -261,6 +274,67 @@ def get_last_snapshot_time() -> Optional[datetime]:
             except (ValueError, TypeError):
                 return None
         return None
+    finally:
+        conn.close()
+
+
+def get_bot_enabled() -> bool:
+    """Return True if bot is enabled, False if paused."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = 'bot_enabled'"
+        ).fetchone()
+        return (row and row[0] and str(row[0]).lower() in ("1", "true", "yes")) if row else True
+    finally:
+        conn.close()
+
+
+def get_api_session() -> Optional[tuple[str, str]]:
+    """Return (session_token, account_json) or None."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT session_token, account_json FROM api_session WHERE id = 1"
+        ).fetchone()
+        return (row[0], row[1]) if row and row[0] else None
+    finally:
+        conn.close()
+
+
+def set_api_session(session_token: str, account_json: str) -> None:
+    """Persist session token and account for reuse."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            """INSERT OR REPLACE INTO api_session (id, session_token, account_json, updated_at)
+               VALUES (1, ?, ?, ?)""",
+            (session_token, account_json, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_api_session() -> None:
+    """Clear persisted session (e.g. on logout or 401)."""
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM api_session WHERE id = 1")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_bot_enabled(enabled: bool) -> None:
+    """Enable or disable the bot."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('bot_enabled', ?)",
+            ("1" if enabled else "0",),
+        )
+        conn.commit()
     finally:
         conn.close()
 

@@ -42,6 +42,11 @@ docker compose up -d
 - **Bot**: Runs every 60 seconds, shares SQLite DB with dashboard
 - **Dashboard**: http://localhost:8502
 
+## When the Bot Trades
+
+- **Docker**: Each cycle (every 60s) the bot logs in, records a bankroll snapshot, then places orders if trading is enabled.
+- **On/Off toggle**: Use the sidebar "Trading enabled" toggle to pause. When paused, the bot still records snapshots but places no orders.
+
 ## Configuration
 
 Edit `config.py` to adjust:
