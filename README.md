@@ -40,7 +40,7 @@ docker compose up -d
 ```
 
 - **Bot**: Runs every 60 seconds, shares SQLite DB with dashboard
-- **Dashboard**: http://localhost:8501
+- **Dashboard**: http://localhost:8502
 
 ## Configuration
 

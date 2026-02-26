@@ -233,6 +233,58 @@ def get_open_positions() -> list[dict]:
         conn.close()
 
 
+def get_trades(limit: int = 100) -> list[dict]:
+    """Return trade history (date, market, selection, side, odds, stake, profit_loss)."""
+    conn = get_connection()
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT timestamp, market_name, runner_name, side, odds, stake, profit_loss
+               FROM trades ORDER BY timestamp DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_last_snapshot_time() -> Optional[datetime]:
+    """Return timestamp of most recent bankroll snapshot, or None."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """SELECT timestamp FROM bankroll_snapshots ORDER BY timestamp DESC LIMIT 1"""
+        ).fetchone()
+        if row and row[0]:
+            try:
+                return datetime.fromisoformat(str(row[0]).replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                return None
+        return None
+    finally:
+        conn.close()
+
+
+def get_daily_pnl(days: int = 30) -> list[tuple[str, float]]:
+    """
+    Return list of (date, pnl) for daily P&L chart.
+    P&L = last balance of day - first balance of day (intraday change).
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT date(timestamp) as d, 
+                      MIN(balance) as first_bal, MAX(balance) as last_bal
+               FROM bankroll_snapshots
+               GROUP BY date(timestamp)
+               ORDER BY d ASC LIMIT ?""",
+            (days,),
+        ).fetchall()
+        return [(r[0], r[2] - r[1]) for r in rows] if rows else []
+    finally:
+        conn.close()
+
+
 def get_daily_roi_pct() -> Optional[float]:
     """
     Compute daily ROI % from today's first snapshot vs latest.
