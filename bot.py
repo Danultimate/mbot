@@ -439,13 +439,15 @@ async def _run_phase1(api: MatchbookAPI) -> None:
                 return True
         return False
 
-    candidates = []
+    # Build candidates per market, then select ONE runner per market (strategy: widest spread)
+    market_candidates: dict[tuple[int, int], list[tuple]] = {}
     for event in events:
         for market in event.get("markets", []):
             if not _market_matches(market.get("market-type", "")):
                 continue
             if market.get("status") != "open":
                 continue
+            key = (event.get("id", 0), market.get("id", 0))
             for runner in market.get("runners", []):
                 if runner.get("status") != "open":
                     continue
@@ -453,9 +455,16 @@ async def _run_phase1(api: MatchbookAPI) -> None:
                 best_back, best_lay = _get_best_back_lay(prices)
                 if best_back is None or best_lay is None:
                     continue
-                candidates.append(
-                    (event, market, runner, best_back, best_lay)
-                )
+                spread = (best_lay or 0) - (best_back or 0)
+                if key not in market_candidates:
+                    market_candidates[key] = []
+                market_candidates[key].append((event, market, runner, best_back, best_lay, spread))
+
+    # One runner per market: pick widest spread (best scalping edge). Tiebreaker: lower odds (liquidity).
+    candidates = []
+    for key, runners in market_candidates.items():
+        best = max(runners, key=lambda r: (r[5], -r[3]))  # max spread, then min best_back
+        candidates.append((best[0], best[1], best[2], best[3], best[4]))
 
     account = api.get_account()
     free_funds = float(account.get("free-funds", 0) or 0)
@@ -719,12 +728,15 @@ async def _run_phase2(api: MatchbookAPI) -> None:
                 return True
         return False
 
+    # Build candidates per market, then select ONE runner per market (widest spread)
+    market_candidates: dict[tuple[int, int], list[tuple]] = {}
     for event in events:
         for market in event.get("markets", []):
             if not _market_matches(market.get("market-type", "")):
                 continue
             if market.get("status") != "open":
                 continue
+            key = (event.get("id", 0), market.get("id", 0))
             for runner in market.get("runners", []):
                 if runner.get("status") != "open":
                     continue
@@ -732,7 +744,6 @@ async def _run_phase2(api: MatchbookAPI) -> None:
                 best_back, best_lay = _get_best_back_lay(prices)
                 if best_back is None or best_lay is None:
                     continue
-
                 back_odds = _round_odds(
                     best_back + config.TICK_SIZE * config.PHASE2_BACK_TICKS_ABOVE
                 )
@@ -741,96 +752,78 @@ async def _run_phase2(api: MatchbookAPI) -> None:
                 )
                 if lay_odds <= back_odds:
                     continue  # No spread to harvest
-
                 stake = min(free_funds * 0.05, 10.0)
                 stake = round(stake, 2)
                 if stake < 2.0:
                     continue
-
-                # Liability check: Lay Stake * (Lay Odds - 1) <= free_funds
                 liability = _lay_liability(stake, lay_odds)
                 if liability > free_funds:
-                    logger.debug("Liability %.2f exceeds free_funds %.2f, skipping", liability, free_funds)
                     continue
+                spread = lay_odds - back_odds
+                if key not in market_candidates:
+                    market_candidates[key] = []
+                market_candidates[key].append((event, market, runner, back_odds, lay_odds, stake, spread))
 
-                try:
-                    if db.get_paper_trading():
-                        db.insert_paper_trade(
-                            event_name=event.get("name", ""),
-                            market_name=market.get("name", ""),
-                            runner_name=runner.get("name", ""),
-                            side="back",
-                            odds=back_odds,
-                            stake=stake,
-                            phase=2,
-                            reason="Phase 2: Back at spread edge",
-                        )
-                        db.insert_paper_trade(
-                            event_name=event.get("name", ""),
-                            market_name=market.get("name", ""),
-                            runner_name=runner.get("name", ""),
-                            side="lay",
-                            odds=lay_odds,
-                            stake=stake,
-                            phase=2,
-                            reason="Phase 2: Lay at spread edge",
-                        )
-                        db.insert_api_log(
-                            "request", "PAPER", "Phase 2 Back+Lay", None,
-                            request_body=f"Would place: {runner.get('name')} Back @ {back_odds} Lay @ {lay_odds} x £{stake}",
-                        )
-                        logger.info(
-                            "PAPER: Phase 2 would place Back %.2f Lay %.2f @ %.2f for %s",
-                            back_odds,
-                            lay_odds,
-                            stake,
-                            runner.get("name"),
-                        )
-                    else:
-                        db.insert_api_log(
-                            "request", "LIVE", "Phase 2 submit_offers", None,
-                            request_body=f"Placing Back+Lay: {runner.get('name')} Back @ {back_odds} Lay @ {lay_odds} x £{stake}",
-                        )
-                        offers = [
-                        {
-                            "runner-id": runner["id"],
-                            "side": "back",
-                            "odds": back_odds,
-                            "stake": stake,
-                            "keep-in-play": False,
-                        },
-                        {
-                            "runner-id": runner["id"],
-                            "side": "lay",
-                            "odds": lay_odds,
-                            "stake": stake,
-                            "keep-in-play": False,
-                        },
-                        ]
-                        result = await api.submit_offers(offers)
-                        if result:
-                            db.insert_api_log(
-                                "response", "LIVE", "Phase 2 submit_offers", 200,
-                                response_body=f"Orders placed: {len(result)} offers",
-                            )
-                            logger.info(
-                                "Phase 2 orders placed: %s Back %.2f Lay %.2f @ %.2f",
-                                runner.get("name"),
-                                back_odds,
-                                lay_odds,
-                                stake,
-                            )
-                        else:
-                            db.insert_api_log("response", "LIVE", "Phase 2 submit_offers", None, error="submit_offers returned empty")
-                except MarketSuspendedError:
-                    logger.warning("Market suspended")
-                    db.insert_api_log("response", "LIVE", "Phase 2", None, error="Market suspended")
-                except Exception as e:
-                    logger.exception("Phase 2 order failed: %s", e)
-                    db.insert_api_log("response", "LIVE", "Phase 2", None, error=str(e))
+    # One runner per market: pick widest harvestable spread
+    phase2_candidates = []
+    for key, runners in market_candidates.items():
+        best = max(runners, key=lambda r: (r[6], -r[3]))  # max spread, then min back_odds
+        phase2_candidates.append(best)
 
-                await asyncio.sleep(config.RATE_LIMIT_DELAY_MS / 1000.0)
-                return  # One market per cycle
+    for event, market, runner, back_odds, lay_odds, stake, _ in phase2_candidates:
+        try:
+            if db.get_paper_trading():
+                db.insert_paper_trade(
+                    event_name=event.get("name", ""),
+                    market_name=market.get("name", ""),
+                    runner_name=runner.get("name", ""),
+                    side="back",
+                    odds=back_odds,
+                    stake=stake,
+                    phase=2,
+                    reason="Phase 2: Back at spread edge",
+                )
+                db.insert_paper_trade(
+                    event_name=event.get("name", ""),
+                    market_name=market.get("name", ""),
+                    runner_name=runner.get("name", ""),
+                    side="lay",
+                    odds=lay_odds,
+                    stake=stake,
+                    phase=2,
+                    reason="Phase 2: Lay at spread edge",
+                )
+                db.insert_api_log(
+                    "request", "PAPER", "Phase 2 Back+Lay", None,
+                    request_body=f"Would place: {runner.get('name')} Back @ {back_odds} Lay @ {lay_odds} x £{stake}",
+                )
+                logger.info(
+                    "PAPER: Phase 2 would place Back %.2f Lay %.2f @ %.2f for %s",
+                    back_odds, lay_odds, stake, runner.get("name"),
+                )
+            else:
+                db.insert_api_log(
+                    "request", "LIVE", "Phase 2 submit_offers", None,
+                    request_body=f"Placing Back+Lay: {runner.get('name')} Back @ {back_odds} Lay @ {lay_odds} x £{stake}",
+                )
+                offers = [
+                    {"runner-id": runner["id"], "side": "back", "odds": back_odds, "stake": stake, "keep-in-play": False},
+                    {"runner-id": runner["id"], "side": "lay", "odds": lay_odds, "stake": stake, "keep-in-play": False},
+                ]
+                result = await api.submit_offers(offers)
+                if result:
+                    db.insert_api_log("response", "LIVE", "Phase 2 submit_offers", 200, response_body=f"Orders placed: {len(result)} offers")
+                    logger.info("Phase 2 orders placed: %s Back %.2f Lay %.2f @ %.2f", runner.get("name"), back_odds, lay_odds, stake)
+                else:
+                    db.insert_api_log("response", "LIVE", "Phase 2 submit_offers", None, error="submit_offers returned empty")
+        except MarketSuspendedError:
+            logger.warning("Market suspended")
+            db.insert_api_log("response", "LIVE", "Phase 2", None, error="Market suspended")
+        except Exception as e:
+            logger.exception("Phase 2 order failed: %s", e)
+            db.insert_api_log("response", "LIVE", "Phase 2", None, error=str(e))
+        await asyncio.sleep(config.RATE_LIMIT_DELAY_MS / 1000.0)
+        return  # One market per cycle
 
 
 async def _main_loop() -> None:
