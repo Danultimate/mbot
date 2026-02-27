@@ -413,6 +413,11 @@ async def _run_phase1(api: MatchbookAPI) -> None:
         per_page=50,
     )
 
+    db.insert_api_log(
+        "response", "BOT", "get_events", None,
+        request_body=f"Phase 1: got {len(events)} events (sport_ids={sport_ids}, market_types={market_types})",
+    )
+
     # Build list of (event, market, runner) with valid prices
     candidates = []
     for event in events:
@@ -438,7 +443,18 @@ async def _run_phase1(api: MatchbookAPI) -> None:
     max_stake = min(free_funds * 0.1, 5.0)
     if max_stake < 2.0:
         logger.info("Insufficient funds for Phase 1 (need >= £2)")
+        db.insert_api_log("response", "BOT", "Phase 1", None, request_body="Skipped: insufficient funds (need free_funds >= £20)")
         return
+
+    if not candidates:
+        logger.info("No tradeable events found (check sport/market filters)")
+        db.insert_api_log("response", "BOT", "Phase 1", None, request_body="No candidates: 0 events with valid prices for selected sports/markets")
+        return
+
+    db.insert_api_log(
+        "response", "BOT", "Phase 1", None,
+        request_body=f"Found {len(candidates)} candidates. Placing up to 5 Back orders (stake £{round(min(free_funds * 0.1, 5.0), 2)})",
+    )
 
     for event, market, runner, best_back, best_lay in candidates[:5]:
         # Place Back at best_back + (TICK_SIZE * BACK_TICKS_ABOVE)
@@ -457,6 +473,10 @@ async def _run_phase1(api: MatchbookAPI) -> None:
                     phase=1,
                     reason="Phase 1: Back at discount (2 ticks above best)",
                 )
+                db.insert_api_log(
+                    "request", "PAPER", "Phase 1 Back", None,
+                    request_body=f"Would place: {runner.get('name')} Back @ {back_odds} x £{stake}",
+                )
                 logger.info(
                     "PAPER: Phase 1 Back would place: %s @ %.2f x %.2f",
                     runner.get("name"),
@@ -464,6 +484,10 @@ async def _run_phase1(api: MatchbookAPI) -> None:
                     stake,
                 )
             else:
+                db.insert_api_log(
+                    "request", "LIVE", "Phase 1 submit_offers", None,
+                    request_body=f"Placing Back: {runner.get('name')} @ {back_odds} x £{stake}",
+                )
                 offers = [
                     {
                         "runner-id": runner["id"],
@@ -498,16 +522,24 @@ async def _run_phase1(api: MatchbookAPI) -> None:
                         entry_stake=stake,
                         offer_id=offer.get("id"),
                     )
+                    db.insert_api_log(
+                        "response", "LIVE", "Phase 1 submit_offers", 200,
+                        response_body=f"Order placed: status={offer.get('status')} offer_id={offer.get('id')}",
+                    )
                     logger.info(
                         "Phase 1 Back placed: %s @ %.2f x %.2f",
                         runner.get("name"),
                         back_odds,
                         stake,
                     )
+                else:
+                    db.insert_api_log("response", "LIVE", "Phase 1 submit_offers", None, error="submit_offers returned empty")
         except MarketSuspendedError:
             logger.warning("Market suspended, skipping")
+            db.insert_api_log("response", "LIVE", "Phase 1", None, error="Market suspended")
         except Exception as e:
             logger.exception("Phase 1 order failed: %s", e)
+            db.insert_api_log("response", "LIVE", "Phase 1", None, error=str(e))
 
         await asyncio.sleep(config.RATE_LIMIT_DELAY_MS / 1000.0)
 
@@ -595,6 +627,11 @@ async def _run_phase2(api: MatchbookAPI) -> None:
         per_page=50,
     )
 
+    db.insert_api_log(
+        "response", "BOT", "get_events", None,
+        request_body=f"Phase 2: got {len(events)} events (sport_ids={sport_ids}, market_types={market_types})",
+    )
+
     for event in events:
         for market in event.get("markets", []):
             if market.get("market-type") not in market_types:
@@ -651,6 +688,10 @@ async def _run_phase2(api: MatchbookAPI) -> None:
                             phase=2,
                             reason="Phase 2: Lay at spread edge",
                         )
+                        db.insert_api_log(
+                            "request", "PAPER", "Phase 2 Back+Lay", None,
+                            request_body=f"Would place: {runner.get('name')} Back @ {back_odds} Lay @ {lay_odds} x £{stake}",
+                        )
                         logger.info(
                             "PAPER: Phase 2 would place Back %.2f Lay %.2f @ %.2f for %s",
                             back_odds,
@@ -659,6 +700,10 @@ async def _run_phase2(api: MatchbookAPI) -> None:
                             runner.get("name"),
                         )
                     else:
+                        db.insert_api_log(
+                            "request", "LIVE", "Phase 2 submit_offers", None,
+                            request_body=f"Placing Back+Lay: {runner.get('name')} Back @ {back_odds} Lay @ {lay_odds} x £{stake}",
+                        )
                         offers = [
                         {
                             "runner-id": runner["id"],
@@ -677,6 +722,10 @@ async def _run_phase2(api: MatchbookAPI) -> None:
                         ]
                         result = await api.submit_offers(offers)
                         if result:
+                            db.insert_api_log(
+                                "response", "LIVE", "Phase 2 submit_offers", 200,
+                                response_body=f"Orders placed: {len(result)} offers",
+                            )
                             logger.info(
                                 "Phase 2 orders placed: %s Back %.2f Lay %.2f @ %.2f",
                                 runner.get("name"),
@@ -684,10 +733,14 @@ async def _run_phase2(api: MatchbookAPI) -> None:
                                 lay_odds,
                                 stake,
                             )
+                        else:
+                            db.insert_api_log("response", "LIVE", "Phase 2 submit_offers", None, error="submit_offers returned empty")
                 except MarketSuspendedError:
                     logger.warning("Market suspended")
+                    db.insert_api_log("response", "LIVE", "Phase 2", None, error="Market suspended")
                 except Exception as e:
                     logger.exception("Phase 2 order failed: %s", e)
+                    db.insert_api_log("response", "LIVE", "Phase 2", None, error=str(e))
 
                 await asyncio.sleep(config.RATE_LIMIT_DELAY_MS / 1000.0)
                 return  # One market per cycle
@@ -711,6 +764,7 @@ async def _main_loop() -> None:
 
         if not trading_enabled:
             logger.info("Bot is paused. Snapshot recorded, no orders placed.")
+            db.insert_api_log("response", "BOT", "main", None, request_body="Skipped: Trading disabled (toggle in sidebar)")
             return
 
         # Pre-match only: close orders for events starting soon

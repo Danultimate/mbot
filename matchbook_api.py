@@ -310,6 +310,19 @@ class MatchbookAPI:
             logger.info("PAPER TRADING: Would submit %d offers", len(offers))
             for o in offers:
                 logger.info("  PAPER: %s %s @ %.2f x %.2f", o.get("side"), o.get("runner-id"), o.get("odds"), o.get("stake"))
+            db.insert_api_log(
+                "request",
+                "POST",
+                f"{config.API_BASE_EDGE}/v2/offers",
+                request_body=f"[PAPER] Would submit {len(offers)} offer(s): " + str(offers)[:2000],
+            )
+            db.insert_api_log(
+                "response",
+                "POST",
+                f"{config.API_BASE_EDGE}/v2/offers",
+                200,
+                response_body="[PAPER] Simulated - no real order sent",
+            )
             return []
 
         await self.ensure_auth()
