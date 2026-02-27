@@ -6,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY config.py db.py matchbook_api.py bot.py app.py alerts.py ./
+COPY pages/ ./pages/
 
 EXPOSE 8501
 

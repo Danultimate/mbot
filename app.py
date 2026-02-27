@@ -68,15 +68,31 @@ def _get_live_data():
         return None, str(e)
 
 
+def _parse_account_balance(account: dict) -> tuple[float, float, float]:
+    """Parse balance, exposure, free_funds from account. Handles various key names."""
+    def _get(key: str, alt: str = "") -> float:
+        v = account.get(key) or account.get(alt)
+        try:
+            return float(v) if v is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+    return (
+        _get("balance", "account-balance"),
+        _get("exposure"),
+        _get("free-funds", "free_funds"),
+    )
+
+
 async def _fetch_live(api: MatchbookAPI):
     """Async fetch of account and offers. Uses persisted session if valid."""
     await api.ensure_auth()
     account = api.get_account()
     offers = await api.get_offers(statuses=["open", "matched"])
+    balance, exposure, free_funds = _parse_account_balance(account)
     return {
-        "balance": float(account.get("balance", 0) or 0),
-        "exposure": float(account.get("exposure", 0) or 0),
-        "free_funds": float(account.get("free-funds", 0) or 0),
+        "balance": balance,
+        "exposure": exposure,
+        "free_funds": free_funds,
         "offers": offers,
     }
 
@@ -227,15 +243,18 @@ def main():
             )
 
         with st.expander("Alerts"):
-            channels = alerts.get_configured_channels()
-            for name, configured in channels.items():
-                st.caption(f"{name.capitalize()}: {'configured' if configured else 'not set'}")
-            if any(channels.values()):
+            status = alerts.get_channel_status()
+            for name, msg in status.items():
+                st.caption(f"{name.capitalize()}: {msg}")
+            if any(alerts.get_configured_channels().values()):
                 if st.button("Test alert", key="test_alert"):
                     alerts.send_alert("This is a test alert from the dashboard.", "test")
                     st.success("Test alert sent to configured channels.")
             else:
-                st.caption("Set ALERT_* env vars to enable. See .env.example.")
+                st.caption(
+                    "Add ALERT_* vars to your .env file to enable. "
+                    "See .env.example for Telegram, Discord, and email options."
+                )
 
         st.subheader("Market / Sport")
         # Sport IDs: Matchbook uses various IDs - 1=Football common; verify via API /edge/rest/lookups/sports
@@ -355,11 +374,13 @@ def main():
         exposure = live["exposure"]
         free_funds = live["free_funds"]
         offers = live["offers"]
+        data_source = "live"
     else:
         balance = bankroll_row[0] if bankroll_row else config.STARTING_BANKROLL
         exposure = bankroll_row[1] if bankroll_row else 0
         free_funds = bankroll_row[2] if bankroll_row else config.STARTING_BANKROLL
         offers = []
+        data_source = "cached" if bankroll_row else "default"
 
     phase = 2 if free_funds >= config.PHASE2_MIN_BANKROLL else 1
     phase_label = "Phase 2 (Market Making)" if phase == 2 else "Phase 1 (Scalping)"
@@ -369,6 +390,8 @@ def main():
     col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         st.metric("Current Bankroll (£)", f"£{balance:.2f}")
+        if data_source != "live":
+            st.caption(f"Source: {data_source} (API failed?)")
     with col2:
         roi_str = f"{daily_roi:.2f}%" if daily_roi is not None else "N/A"
         st.metric("Daily ROI (%)", roi_str)

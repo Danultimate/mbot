@@ -94,7 +94,20 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
             CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
             CREATE INDEX IF NOT EXISTS idx_bankroll_timestamp ON bankroll_snapshots(timestamp);
+            CREATE TABLE IF NOT EXISTS api_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                method TEXT,
+                url TEXT,
+                status INTEGER,
+                request_body TEXT,
+                response_body TEXT,
+                error TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_paper_trades_timestamp ON paper_trades(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_api_logs_timestamp ON api_logs(timestamp);
         """)
         conn.commit()
     finally:
@@ -723,5 +736,54 @@ def get_daily_roi_pct() -> Optional[float]:
         if first and latest and first[0] and first[0] > 0:
             return ((latest[0] - first[0]) / first[0]) * 100
         return None
+    finally:
+        conn.close()
+
+
+def insert_api_log(
+    direction: str,
+    method: str = "",
+    url: str = "",
+    status: Optional[int] = None,
+    request_body: Optional[str] = None,
+    response_body: Optional[str] = None,
+    error: Optional[str] = None,
+) -> None:
+    """Log an API request or response for debugging."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            """INSERT INTO api_logs (timestamp, direction, method, url, status, request_body, response_body, error)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                datetime.utcnow().isoformat(),
+                direction,
+                method or "",
+                url or "",
+                status,
+                (request_body or "")[:10000] if request_body else None,
+                (response_body or "")[:10000] if response_body else None,
+                (error or "")[:2000] if error else None,
+            ),
+        )
+        conn.commit()
+        # Keep only last 500 logs
+        conn.execute("DELETE FROM api_logs WHERE id NOT IN (SELECT id FROM api_logs ORDER BY id DESC LIMIT 500)")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_api_logs(limit: int = 100) -> list[dict]:
+    """Return recent API logs for the debug page."""
+    conn = get_connection()
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT id, timestamp, direction, method, url, status, request_body, response_body, error
+               FROM api_logs ORDER BY id DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
     finally:
         conn.close()

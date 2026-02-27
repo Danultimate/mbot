@@ -125,3 +125,24 @@ def get_configured_channels() -> dict[str, bool]:
             and os.getenv("ALERT_EMAIL_TO", "").strip()
         ),
     }
+
+
+def get_channel_status() -> dict[str, str]:
+    """Return channel -> status string for dashboard. Shows what's missing if partial."""
+    def _status(name: str, configured: bool, missing: str) -> str:
+        return "configured" if configured else f"missing {missing}"
+
+    token = os.getenv("ALERT_TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("ALERT_TELEGRAM_CHAT_ID", "").strip()
+    tg_ok = bool(token and chat_id)
+    tg_missing = "ALERT_TELEGRAM_CHAT_ID" if token and not chat_id else "ALERT_TELEGRAM_BOT_TOKEN, ALERT_TELEGRAM_CHAT_ID" if not tg_ok else ""
+
+    discord_url = os.getenv("ALERT_DISCORD_WEBHOOK_URL", "").strip()
+    disc_ok = bool(discord_url)
+    disc_missing = "ALERT_DISCORD_WEBHOOK_URL" if not disc_ok else ""
+
+    return {
+        "telegram": _status("telegram", tg_ok, tg_missing),
+        "discord": _status("discord", disc_ok, disc_missing),
+        "email": "configured" if get_configured_channels()["email"] else "missing ALERT_EMAIL_* vars",
+    }

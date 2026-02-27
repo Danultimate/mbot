@@ -139,11 +139,14 @@ class MatchbookAPI:
         payload = {"username": username, "password": password}
 
         try:
+            safe_payload = {k: ("***" if k == "password" else v) for k, v in payload.items()}
+            db.insert_api_log("request", "POST", url, request_body=json.dumps(safe_payload))
             async with session.post(
                 url, json=payload, headers=self._auth_headers()
             ) as resp:
                 body = await resp.text()
                 await self._rate_limit()
+                db.insert_api_log("response", "POST", url, resp.status, response_body=body[:5000])
 
                 if resp.status == 200:
                     data = json.loads(body) if body else {}
@@ -167,13 +170,16 @@ class MatchbookAPI:
                     raise MatchbookAPIError(resp.status, err_msg, body)
         except aiohttp.ClientError as e:
             logger.error("Network error during login: %s", e)
+            db.insert_api_log("response", "POST", url, error=str(e))
             alerts.send_alert(f"Login failed (network): {e}", "auth_failure")
             raise
         except asyncio.TimeoutError:
             logger.error("Login timeout")
+            db.insert_api_log("response", "POST", url, error="Timeout")
             alerts.send_alert("Login failed: timeout", "auth_failure")
             raise
         except MatchbookAPIError as e:
+            db.insert_api_log("response", "POST", url, getattr(e, 'status', 0), error=str(e))
             alerts.send_alert(f"Login failed: {e}", "auth_failure")
             raise
 
@@ -189,20 +195,25 @@ class MatchbookAPI:
         Make HTTP request. On 401, clear session, login, retry once.
         Returns (status_code, body).
         """
+        req_body = json.dumps(kwargs.get("json")) if kwargs.get("json") else (str(kwargs.get("params")) if kwargs.get("params") else None)
+        db.insert_api_log("request", method, url, request_body=req_body)
         session = await self._ensure_session()
         async with session.request(
             method, url, headers=self._auth_headers(), **kwargs
         ) as resp:
             body = await resp.text()
             await self._rate_limit()
+            db.insert_api_log("response", method, url, resp.status, response_body=body[:5000])
             if resp.status == 401 and retry_on_401 and self._session_token:
                 self._clear_session()
                 await self.login()
+                db.insert_api_log("request", method, url, request_body="(retry after 401)")
                 async with session.request(
                     method, url, headers=self._auth_headers(), **kwargs
                 ) as retry_resp:
                     retry_body = await retry_resp.text()
                     await self._rate_limit()
+                    db.insert_api_log("response", method, url, retry_resp.status, response_body=retry_body[:5000])
                     return retry_resp.status, retry_body
             return resp.status, body
 
@@ -210,10 +221,18 @@ class MatchbookAPI:
         """
         Return account info from last login: balance, exposure, free-funds.
         Call login() or ensure_auth() first to populate.
+        Handles various API key names (balance, account-balance, free-funds, free_funds).
         """
         if self._account is None:
             return {"balance": 0, "exposure": 0, "free-funds": 0}
-        return self._account
+        acc = self._account
+        balance = acc.get("balance") or acc.get("account-balance")
+        free_funds = acc.get("free-funds") or acc.get("free_funds")
+        return {
+            "balance": float(balance) if balance is not None else 0,
+            "exposure": float(acc.get("exposure") or 0) if acc.get("exposure") is not None else 0,
+            "free-funds": float(free_funds) if free_funds is not None else 0,
+        }
 
     async def get_events(
         self,
