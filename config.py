@@ -50,9 +50,8 @@ def net_profit_after_commission(
 DAILY_STOP_LOSS_PCT = 10.0
 
 # Market focus: configurable for Football, Political, or both
-# Football sport-id is typically 1; political uses category-ids
-# See Matchbook API docs for sport-ids and category-ids
-SPORT_IDS = [1]  # 1 = Football/Soccer; add political category ids as needed
+# Sport IDs: 1 = American Football (NOT Soccer). Use API Debug → Fetch sports for full list.
+SPORT_IDS = [1]  # Fallback; override in dashboard from Fetch sports
 # Match Odds (one_x_two / money_line), O/U 2.5 Goals
 MARKET_TYPES = ["one_x_two", "money_line", "over_under_25"]
 

@@ -257,32 +257,41 @@ def main():
                 )
 
         st.subheader("Market / Sport")
-        # Sport IDs from Matchbook API – verify via API Debug → Fetch sports (IDs vary by region)
+        # Sport IDs from Matchbook – ID 1 = American Football. Fetch sports for Soccer/Football.
         sport_options = {
-            "Football": [1],
-            "Tennis": [9],
-            "Horse Racing": [7],
-            "Politics": [6],
+            "American Football": [1],
             "Basketball": [4],
             "Cricket": [110],
             "Darts": [116],
+            "Gaelic Football": [117],
             "Golf": [8],
+            "Tennis": [9],
         }
         current_sports = db.get_sport_ids()
         sport_labels = [k for k, v in sport_options.items() if any(x in current_sports for x in v)]
         selected_sports = st.multiselect(
             "Sports",
             options=list(sport_options.keys()),
-            default=sport_labels if sport_labels else ["Football"],
+            default=sport_labels if sport_labels else ["Cricket"],
             key="sport_select",
         )
         sport_ids = []
         for s in selected_sports:
             sport_ids.extend(sport_options.get(s, []))
+        # Extra IDs from Fetch sports (e.g. Soccer – type comma-separated)
+        all_option_ids = {i for v in sport_options.values() for i in v}
+        extra_ids = [x for x in current_sports if x not in all_option_ids]
+        extra_default = ", ".join(str(x) for x in extra_ids) if extra_ids else ""
+        if "extra_sport_ids" not in st.session_state and extra_default:
+            st.session_state["extra_sport_ids"] = extra_default
+        extra = st.text_input("+ Extra sport IDs (from Fetch sports)", placeholder="e.g. 2, 15", key="extra_sport_ids")
+        for part in (extra or "").replace(" ", "").split(","):
+            if part.isdigit():
+                sport_ids.append(int(part))
         if set(sport_ids) != set(current_sports):
-            db.set_sport_ids(sport_ids if sport_ids else [1])
+            db.set_sport_ids(sport_ids if sport_ids else [110])
             st.rerun()
-        st.caption("Sport IDs may vary. Use API Debug → Fetch sports to see your region's IDs.")
+        st.caption("ID 1 = American Football. Fetch sports + filter 'soccer' to find Football. Add extra IDs above.")
 
         market_options = {
             "Match Odds": "one_x_two",

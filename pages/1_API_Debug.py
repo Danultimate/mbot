@@ -68,15 +68,25 @@ if st.button("Fetch sports", key="fetch_sports"):
             return sports
 
         sports = asyncio.run(_fetch())
-        if sports:
-            st.success(f"Found {len(sports)} sports")
-            st.table([{"id": s["id"], "name": s["name"], "type": s.get("type", "")} for s in sports])
-        else:
-            st.warning("No sports returned")
+        st.session_state["api_sports"] = sports
     except Exception as e:
         st.error(f"Fetch failed: {e}")
         import traceback
         st.code(traceback.format_exc())
+
+if "api_sports" in st.session_state:
+    sports = st.session_state["api_sports"]
+    if sports:
+        st.success(f"Found {len(sports)} sports (full list)")
+        search = st.text_input("Filter by name (e.g. soccer, football)", key="sport_filter")
+        rows = [{"id": s["id"], "name": s["name"], "type": s.get("type", "")} for s in sports]
+        if search:
+            q = search.lower()
+            rows = [r for r in rows if q in str(r.get("name", "")).lower()]
+            st.caption(f"Showing {len(rows)} matching '{search}'")
+        st.table(rows)
+    else:
+        st.warning("No sports returned")
 
 # Diagnose events – try without filters to see if API returns events
 if st.button("Diagnose events (no sport/after filter)", key="diagnose_events"):

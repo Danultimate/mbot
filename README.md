@@ -1,6 +1,6 @@
 # Matchbook Automated Trading System
 
-A local automated trading system for the Matchbook Exchange with a headless Python bot and Streamlit dashboard. Target: compound £25 to £5,000 at 5% daily ROI.
+A local automated trading system for the Matchbook Exchange with a headless Python bot and Streamlit dashboard. 
 
 ## Setup
 

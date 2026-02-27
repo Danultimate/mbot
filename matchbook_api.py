@@ -250,19 +250,34 @@ class MatchbookAPI:
             "free-funds": float(free_funds) if free_funds is not None else 0,
         }
 
-    async def get_sports(self) -> list[dict]:
+    async def get_sports(self, per_page: int = 200) -> list[dict]:
         """
         Fetch list of sports from Matchbook.
         GET edge/rest/lookups/sports - use to discover correct sport-ids for get_events.
+        Fetches all pages to return the full list (Football/Soccer may be beyond first 20).
         """
         await self.ensure_auth()
         url = f"{config.API_BASE_EDGE}/lookups/sports"
+        all_sports: list[dict] = []
+        offset = 0
         try:
-            status, body = await self._request_with_retry("GET", url, retry_on_401=False)
-            if status != 200:
-                raise MatchbookAPIError(status, f"get_sports failed: {body[:200]}", body)
-            data = json.loads(body) if body else {}
-            return data.get("sports", [])
+            while True:
+                params = {"per-page": per_page, "offset": offset}
+                status, body = await self._request_with_retry(
+                    "GET", url, params=params, retry_on_401=False
+                )
+                if status != 200:
+                    raise MatchbookAPIError(status, f"get_sports failed: {body[:200]}", body)
+                data = json.loads(body) if body else {}
+                sports = data.get("sports", [])
+                if not sports:
+                    break
+                all_sports.extend(sports)
+                total = data.get("total", 0)
+                if offset + len(sports) >= total:
+                    break
+                offset += len(sports)
+            return all_sports
         except aiohttp.ClientError as e:
             logger.error("get_sports network error: %s", e)
             raise
