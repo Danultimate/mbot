@@ -447,8 +447,30 @@ async def _run_phase1(api: MatchbookAPI) -> None:
         return
 
     if not candidates:
-        logger.info("No tradeable events found (check sport/market filters)")
-        db.insert_api_log("response", "BOT", "Phase 1", None, request_body="No candidates: 0 events with valid prices for selected sports/markets")
+        # Diagnose why: count events, markets, runners, and runners with prices
+        n_events = len(events)
+        n_markets = sum(len(e.get("markets", [])) for e in events)
+        n_runners = 0
+        n_with_prices = 0
+        market_types_seen = set()
+        for e in events:
+            for m in e.get("markets", []):
+                market_types_seen.add(m.get("market-type", "?"))
+                for r in m.get("runners", []):
+                    n_runners += 1
+                    prices = r.get("prices", [])
+                    if prices:
+                        n_with_prices += 1
+        diag = (
+            f"No candidates: {n_events} events, {n_markets} markets, {n_runners} runners, "
+            f"{n_with_prices} with prices. Market types in data: {market_types_seen}. "
+            f"Looking for: {market_types}"
+        )
+        logger.info("No tradeable events found: %s", diag)
+        db.insert_api_log(
+            "response", "BOT", "Phase 1", None,
+            request_body=f"No candidates. Events={n_events}, markets={n_markets}, runners={n_runners}, with_prices={n_with_prices}. Market types in data: {market_types_seen}. Need: {market_types}",
+        )
         return
 
     db.insert_api_log(
