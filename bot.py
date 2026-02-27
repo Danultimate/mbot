@@ -487,10 +487,37 @@ async def _run_phase1(api: MatchbookAPI) -> None:
             f"Looking for: {market_types}"
         )
         logger.info("No tradeable events found: %s", diag)
-        db.insert_api_log(
-            "response", "BOT", "Phase 1", None,
-            request_body=f"No candidates. Events={n_events}, markets={n_markets}, runners={n_runners}, with_prices={n_with_prices}. Market types in data: {market_types_seen}. Need: {market_types}",
-        )
+
+        # When 0 events: try fallback without sport/after filters to diagnose
+        fallback_msg = ""
+        if n_events == 0:
+            try:
+                fallback = await api.get_events(
+                    sport_ids=None,
+                    include_prices=True,
+                    price_depth=1,
+                    states="open,suspended",
+                    per_page=20,
+                    pre_match_only=False,
+                )
+                sport_ids_in_fallback = list({e.get("sport-id") for e in fallback if e.get("sport-id") is not None})
+                fallback_msg = (
+                    f" Fallback (no sport/after filter): {len(fallback)} events. "
+                    f"Sport IDs in fallback: {sport_ids_in_fallback}. "
+                    f"→ Use API Debug 'Fetch sports' to get correct sport-ids."
+                )
+            except Exception as e:
+                fallback_msg = f" Fallback failed: {e}"
+            logger.info("Diagnostic: %s", fallback_msg)
+            db.insert_api_log(
+                "response", "BOT", "Phase 1 diagnostic", None,
+                request_body=f"No candidates. Events={n_events}, markets={n_markets}, runners={n_runners}, with_prices={n_with_prices}. Market types in data: {market_types_seen}. Need: {market_types}.{fallback_msg}",
+            )
+        else:
+            db.insert_api_log(
+                "response", "BOT", "Phase 1", None,
+                request_body=f"No candidates. Events={n_events}, markets={n_markets}, runners={n_runners}, with_prices={n_with_prices}. Market types in data: {market_types_seen}. Need: {market_types}",
+            )
         return
 
     db.insert_api_log(
@@ -674,9 +701,27 @@ async def _run_phase2(api: MatchbookAPI) -> None:
         request_body=f"Phase 2: got {len(events)} events (sport_ids={sport_ids}, market_types={market_types})",
     )
 
+    def _norm(s: str) -> str:
+        return (s or "").lower().replace("-", "_").replace(".", "_").replace(" ", "_")
+
+    def _canonical(s: str) -> str:
+        n = _norm(s)
+        if n in ("over_under_2_5", "over_under_25"):
+            return "over_under_25"
+        return n
+
+    def _market_matches(mt: str) -> bool:
+        if not mt:
+            return False
+        mt_c = _canonical(mt)
+        for want in market_types:
+            if mt_c == _canonical(want):
+                return True
+        return False
+
     for event in events:
         for market in event.get("markets", []):
-            if market.get("market-type") not in market_types:
+            if not _market_matches(market.get("market-type", "")):
                 continue
             if market.get("status") != "open":
                 continue

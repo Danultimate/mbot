@@ -257,12 +257,16 @@ def main():
                 )
 
         st.subheader("Market / Sport")
-        # Sport IDs: Matchbook uses various IDs - 1=Football common; verify via API /edge/rest/lookups/sports
+        # Sport IDs from Matchbook API – verify via API Debug → Fetch sports (IDs vary by region)
         sport_options = {
             "Football": [1],
-            "Tennis": [2],
+            "Tennis": [9],
             "Horse Racing": [7],
             "Politics": [6],
+            "Basketball": [4],
+            "Cricket": [110],
+            "Darts": [116],
+            "Golf": [8],
         }
         current_sports = db.get_sport_ids()
         sport_labels = [k for k, v in sport_options.items() if any(x in current_sports for x in v)]
@@ -278,6 +282,7 @@ def main():
         if set(sport_ids) != set(current_sports):
             db.set_sport_ids(sport_ids if sport_ids else [1])
             st.rerun()
+        st.caption("Sport IDs may vary. Use API Debug → Fetch sports to see your region's IDs.")
 
         market_options = {
             "Match Odds": "one_x_two",

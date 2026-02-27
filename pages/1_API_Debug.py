@@ -50,6 +50,69 @@ if st.button("Test connection now", key="test_conn"):
 
 st.divider()
 
+# Fetch sports – discover correct sport-ids for get_events
+st.subheader("Discover sport IDs")
+st.caption(
+    "Matchbook uses numeric sport IDs (e.g. Football may not be 1). "
+    "Fetch the list and update your Sports selection in the sidebar."
+)
+if st.button("Fetch sports", key="fetch_sports"):
+    try:
+        from matchbook_api import MatchbookAPI
+        import asyncio
+
+        async def _fetch():
+            api = MatchbookAPI()
+            sports = await api.get_sports()
+            await api.close()
+            return sports
+
+        sports = asyncio.run(_fetch())
+        if sports:
+            st.success(f"Found {len(sports)} sports")
+            st.table([{"id": s["id"], "name": s["name"], "type": s.get("type", "")} for s in sports])
+        else:
+            st.warning("No sports returned")
+    except Exception as e:
+        st.error(f"Fetch failed: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+
+# Diagnose events – try without filters to see if API returns events
+if st.button("Diagnose events (no sport/after filter)", key="diagnose_events"):
+    try:
+        from matchbook_api import MatchbookAPI
+        import asyncio
+
+        async def _diagnose():
+            api = MatchbookAPI()
+            events = await api.get_events(
+                sport_ids=None,
+                include_prices=True,
+                price_depth=1,
+                states="open,suspended",
+                per_page=20,
+                pre_match_only=False,
+            )
+            await api.close()
+            return events
+
+        events = asyncio.run(_diagnose())
+        st.success(f"Got {len(events)} events (no sport/after filter)")
+        if events:
+            sport_ids = list({e.get("sport-id") for e in events if e.get("sport-id") is not None})
+            st.info(f"Sport IDs in these events: {sport_ids}. Use these in your Sports selection.")
+            sample = events[0]
+            st.json({"sample_event": {"id": sample.get("id"), "name": sample.get("name"), "sport-id": sample.get("sport-id"), "markets_count": len(sample.get("markets", []))}})
+        else:
+            st.warning("0 events – API may be empty or auth/region issue.")
+    except Exception as e:
+        st.error(f"Diagnose failed: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+
+st.divider()
+
 # Log display options
 limit = st.slider("Show last N log entries", min_value=10, max_value=200, value=50, key="log_limit")
 show_requests = st.checkbox("Show requests", value=True, key="show_req")
