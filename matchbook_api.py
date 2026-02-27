@@ -277,6 +277,7 @@ class MatchbookAPI:
             "odds-type": "DECIMAL",
             "per-page": per_page,
             "offset": offset,
+            "minimum-liquidity": 0,  # Include all prices (default 2 can filter out thin markets)
         }
         if sport_ids:
             params["sport-ids"] = ",".join(str(s) for s in sport_ids)

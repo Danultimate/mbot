@@ -419,10 +419,30 @@ async def _run_phase1(api: MatchbookAPI) -> None:
     )
 
     # Build list of (event, market, runner) with valid prices
+    # Matchbook may use one_x_two, one-x-two, money_line, over_under_25, over-under-2-5, etc.
+    def _norm(s: str) -> str:
+        return (s or "").lower().replace("-", "_").replace(".", "_").replace(" ", "_")
+
+    # Aliases: Matchbook slugs can vary (e.g. over-under-2-5 vs over_under_25)
+    def _canonical(s: str) -> str:
+        n = _norm(s)
+        if n in ("over_under_2_5", "over_under_25"):
+            return "over_under_25"
+        return n
+
+    def _market_matches(mt: str) -> bool:
+        if not mt:
+            return False
+        mt_c = _canonical(mt)
+        for want in market_types:
+            if mt_c == _canonical(want):
+                return True
+        return False
+
     candidates = []
     for event in events:
         for market in event.get("markets", []):
-            if market.get("market-type") not in market_types:
+            if not _market_matches(market.get("market-type", "")):
                 continue
             if market.get("status") != "open":
                 continue
