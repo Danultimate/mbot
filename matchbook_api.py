@@ -154,6 +154,22 @@ class MatchbookAPI:
                     self._account = data.get("account", {})
                     if not self._session_token:
                         raise MatchbookAPIError(200, "No session-token in response", body)
+                    # If login account is empty or has no balance, fetch from dedicated balance endpoint
+                    has_balance = (self._account.get("balance") or 0) != 0 or (self._account.get("free-funds") or 0) != 0
+                    if not self._account or not has_balance:
+                        try:
+                            bal_status, bal_body = await self._request_with_retry(
+                                "GET", f"{config.API_BASE_EDGE}/account/balance", retry_on_401=False
+                            )
+                            if bal_status == 200 and bal_body:
+                                bal_data = json.loads(bal_body)
+                                self._account = {
+                                    "balance": bal_data.get("balance", 0),
+                                    "exposure": bal_data.get("exposure", 0),
+                                    "free-funds": bal_data.get("free-funds", 0),
+                                }
+                        except Exception as e:
+                            logger.warning("Could not fetch balance from /account/balance: %s", e)
                     self._save_session()
                     logger.info("Login successful (session persisted)")
                     return data

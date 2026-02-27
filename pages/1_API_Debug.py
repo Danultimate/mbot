@@ -17,7 +17,13 @@ st.caption(
 
 db.init_db()
 
-# Test connection button
+# Test connection – optionally force re-login to see POST /security/session
+force_relogin = st.checkbox(
+    "Force re-login (clears saved session first)",
+    value=False,
+    help="Check this to trigger a fresh login. You'll see the POST to /security/session with account/balance in the response.",
+    key="force_relogin",
+)
 if st.button("Test connection now", key="test_conn"):
     try:
         from matchbook_api import MatchbookAPI
@@ -25,6 +31,8 @@ if st.button("Test connection now", key="test_conn"):
 
         async def _test():
             api = MatchbookAPI()
+            if force_relogin:
+                api._clear_session()
             await api.ensure_auth()
             account = api.get_account()
             await api.close()
@@ -33,6 +41,8 @@ if st.button("Test connection now", key="test_conn"):
         account = asyncio.run(_test())
         st.success("Connection OK")
         st.json(account)
+        if force_relogin:
+            st.info("Check the log below for the POST /security/session request and response (with account balance).")
     except Exception as e:
         st.error(f"Connection failed: {e}")
         import traceback
