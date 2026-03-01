@@ -375,6 +375,29 @@ def _parse_event_start(start_str: Optional[str]) -> Optional[datetime]:
         return None
 
 
+async def _cancel_high_odds_orders(api: MatchbookAPI) -> None:
+    """
+    Cancel open/unmatched orders where odds > MAX_ODDS_CANCEL (4.50).
+    These are dead trades (massive underdogs, poor scalping).
+    """
+    if db.get_paper_trading():
+        return
+    offers = await api.get_offers(statuses=["open"])
+    to_cancel = []
+    for o in offers:
+        if o.get("status") != "open":
+            continue
+        odds = float(o.get("odds", 0) or o.get("decimal-odds", 0) or 0)
+        if odds > config.MAX_ODDS_CANCEL:
+            to_cancel.append(o.get("id"))
+    if to_cancel:
+        try:
+            await api.cancel_offers(offer_ids=to_cancel)
+            logger.info("Cancelled %d high-odds orders (odds > %.2f)", len(to_cancel), config.MAX_ODDS_CANCEL)
+        except Exception as e:
+            logger.warning("Failed to cancel high-odds orders: %s", e)
+
+
 async def _cancel_low_volume_orders(api: MatchbookAPI) -> None:
     """
     Cancel any OPEN orders in markets with volume < LOW_VOLUME_CANCEL_THRESHOLD (£1k).
@@ -557,6 +580,8 @@ async def _run_phase1(api: MatchbookAPI) -> None:
                 best_back, best_lay = _get_best_back_lay(prices)
                 if best_back is None or best_lay is None:
                     continue
+                if best_back < config.MIN_ODDS or best_back > config.MAX_ODDS:
+                    continue  # Odds filter: sweet spot 1.50–4.00 only
                 spread = (best_lay or 0) - (best_back or 0)
                 if key not in market_candidates:
                     market_candidates[key] = []
@@ -565,6 +590,8 @@ async def _run_phase1(api: MatchbookAPI) -> None:
     # One runner per market: pick widest spread (best scalping edge). Tiebreaker: lower odds (liquidity).
     candidates = []
     for key, runners in market_candidates.items():
+        if not runners:
+            continue
         best = max(runners, key=lambda r: (r[5], -r[3]))  # max spread, then min best_back
         candidates.append((best[0], best[1], best[2], best[3], best[4]))
 
@@ -867,6 +894,8 @@ async def _run_phase2(api: MatchbookAPI) -> None:
                 best_back, best_lay = _get_best_back_lay(prices)
                 if best_back is None or best_lay is None:
                     continue
+                if best_back < config.MIN_ODDS or best_back > config.MAX_ODDS:
+                    continue  # Odds filter: sweet spot 1.50–4.00 only
                 back_odds = _round_odds(
                     best_back + config.TICK_SIZE * config.PHASE2_BACK_TICKS_ABOVE
                 )
@@ -890,6 +919,8 @@ async def _run_phase2(api: MatchbookAPI) -> None:
     # One runner per market: pick widest harvestable spread
     phase2_candidates = []
     for key, runners in market_candidates.items():
+        if not runners:
+            continue
         best = max(runners, key=lambda r: (r[6], -r[3]))  # max spread, then min back_odds
         phase2_candidates.append(best)
 
@@ -991,6 +1022,9 @@ async def _main_loop() -> None:
 
         # Cancel open orders stuck in low-volume markets (<£1k)
         await _cancel_low_volume_orders(api)
+
+        # Cancel dead trades: open orders with odds > 4.50 (massive underdogs)
+        await _cancel_high_odds_orders(api)
 
         # Daily stop-loss: pause if today's loss exceeds limit
         if db.get_stop_loss_triggered():

@@ -79,6 +79,11 @@ MAX_HEDGE_RETRIES = 30
 # Database path (override via DB_PATH env for Docker)
 DB_PATH = os.getenv("DB_PATH", "trading.db")
 
+# Odds filter (The Sweet Spot): only trade selections between 1.50 and 4.00
+MIN_ODDS = 1.50   # Skip heavy favorites
+MAX_ODDS = 4.00   # Skip massive underdogs (wide spreads, poor scalping)
+MAX_ODDS_CANCEL = 4.50  # Cancel open orders above this (dead trades)
+
 # Liquidity filter: only trade in high-volume markets
 MIN_EVENT_VOLUME = 50_000   # £50k min event volume (excludes obscure leagues)
 MIN_MARKET_VOLUME = 50_000  # £50k min market volume
