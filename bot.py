@@ -773,14 +773,26 @@ async def _run_phase1(api: MatchbookAPI) -> None:
     await hedge_all_matched_positions(api)
 
 
+def _runners_with_open_offers(offers: list[dict], side: str) -> set[tuple[int, int]]:
+    """Return set of (market_id, runner_id) that already have an open offer of given side."""
+    return {
+        (int(o.get("market-id", 0) or 0), int(o.get("runner-id", 0) or 0))
+        for o in offers
+        if o.get("status") == "open" and o.get("side", "").lower() == side.lower()
+    }
+
+
 async def hedge_all_matched_positions(
     api: MatchbookAPI, hedge_all: bool = False
 ) -> None:
     """
     Fetch matched offers and hedge each (Back with Lay, Lay with Back).
+    Exit state check: never place a hedge if an open hedge order already exists.
     hedge_all=True: process all matched (panic hedge). False: one per call (bot cycle).
     """
     offers = await api.get_offers(statuses=["open", "matched"])
+    open_lay_runners = _runners_with_open_offers(offers, "lay")
+    open_back_runners = _runners_with_open_offers(offers, "back")
     count = 0
     for offer in offers:
         if offer.get("status") != "matched":
@@ -791,9 +803,12 @@ async def hedge_all_matched_positions(
         if stake <= 0 or odds <= 0 or not runner_id:
             continue
         market_id = offer.get("market-id") or 0
+        key = (int(market_id or 0), int(runner_id or 0))
         market_name = offer.get("market-name", "")
         runner_name = offer.get("runner-name", "")
         if offer.get("side") == "back":
+            if key in open_lay_runners:
+                continue  # Exit state check: Lay hedge already pending, don't stack
             if not db.get_paper_trading():
                 await _hedge_with_retry(
                     api, runner_id, stake, odds,
@@ -801,6 +816,8 @@ async def hedge_all_matched_positions(
                     market_id=market_id, back_offer_id=offer.get("id"),
                 )
         elif offer.get("side") == "lay":
+            if key in open_back_runners:
+                continue  # Exit state check: Back hedge already pending, don't stack
             if not db.get_paper_trading():
                 await _hedge_lay_with_retry(
                     api, runner_id, stake, odds,
