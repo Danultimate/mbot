@@ -314,6 +314,7 @@ class MatchbookAPI:
             "offset": offset,
             "minimum-liquidity": 0,  # Include all prices (default 2 can filter out thin markets)
             "markets-limit": 20,  # Max markets per event (ensure we get match odds, O/U, etc.)
+            "_": int(time.time() * 1000),  # Cache-bust: avoid stale cached responses
         }
         if sport_ids:
             params["sport-ids"] = ",".join(str(s) for s in sport_ids)
@@ -323,8 +324,9 @@ class MatchbookAPI:
         if not event_ids and (pre_match_only if pre_match_only is not None else db.get_pre_match_only()):
             params["after"] = int(time.time())
 
+        headers = {**self._auth_headers(), "Cache-Control": "no-cache", "Pragma": "no-cache"}
         try:
-            status, body = await self._request_with_retry("GET", url, params=params)
+            status, body = await self._request_with_retry("GET", url, params=params, headers=headers)
             await self._check_suspended(status, body)
             if status != 200:
                 raise MatchbookAPIError(status, f"get_events failed: {body[:200]}", body)
