@@ -63,6 +63,9 @@ BACK_TICKS_ABOVE = 2
 PHASE2_BACK_TICKS_ABOVE = 1
 PHASE2_LAY_TICKS_BELOW = 1
 
+# Entry cooldown: seconds after a trade is hedged before re-entering same selection
+ENTRY_COOLDOWN_SEC = 60
+
 # Rate limiting (ms between API requests)
 RATE_LIMIT_DELAY_MS = 100
 # Market suspended: retry hedge every N seconds

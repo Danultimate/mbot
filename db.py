@@ -108,6 +108,13 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_paper_trades_timestamp ON paper_trades(timestamp);
             CREATE INDEX IF NOT EXISTS idx_api_logs_timestamp ON api_logs(timestamp);
+
+            CREATE TABLE IF NOT EXISTS hedge_cooldowns (
+                market_id INTEGER NOT NULL,
+                runner_id INTEGER NOT NULL,
+                closed_at TEXT NOT NULL,
+                PRIMARY KEY (market_id, runner_id)
+            );
         """)
         conn.commit()
     finally:
@@ -284,6 +291,58 @@ def get_open_positions() -> list[dict]:
                FROM positions WHERE status = 'open'"""
         ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def has_open_position_for_runner(market_id: int, runner_id: int) -> bool:
+    """Return True if we have an open position for this market/runner."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """SELECT 1 FROM positions WHERE market_id = ? AND runner_id = ? AND status = 'open'""",
+            (market_id, runner_id),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def record_hedge_cooldown(market_id: int, runner_id: int) -> None:
+    """Record that we hedged this selection; starts cooldown period."""
+    conn = get_connection()
+    try:
+        now = datetime.utcnow().isoformat()
+        conn.execute(
+            """INSERT OR REPLACE INTO hedge_cooldowns (market_id, runner_id, closed_at)
+               VALUES (?, ?, ?)""",
+            (market_id, runner_id, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def is_on_cooldown(market_id: int, runner_id: int, cooldown_sec: float = 60) -> bool:
+    """Return True if we hedged this selection within cooldown_sec and cannot re-enter yet."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT closed_at FROM hedge_cooldowns WHERE market_id = ? AND runner_id = ?",
+            (market_id, runner_id),
+        ).fetchone()
+        if not row or not row[0]:
+            return False
+        try:
+            s = str(row[0]).replace("Z", "").split("+")[0].rstrip()
+            closed = datetime.fromisoformat(s)
+            if closed.tzinfo:
+                closed = closed.replace(tzinfo=None)
+            now = datetime.utcnow()
+            elapsed = (now - closed).total_seconds()
+            return 0 <= elapsed < cooldown_sec
+        except (ValueError, TypeError):
+            return False
     finally:
         conn.close()
 

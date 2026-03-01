@@ -83,6 +83,27 @@ def _lay_liability(lay_stake: float, lay_odds: float) -> float:
     return lay_stake * (lay_odds - 1)
 
 
+def _can_enter_selection(
+    market_id: int,
+    runner_id: int,
+    exposed_runners: set[tuple[int, int]],
+) -> bool:
+    """
+    Strict pre-entry check: zero open/unmatched positions for this market/selection.
+    Returns False if we have exposure or are on cooldown.
+    """
+    if db.has_open_position_for_runner(market_id, runner_id):
+        logger.debug("Skip %s/%s: open position", market_id, runner_id)
+        return False
+    if db.is_on_cooldown(market_id, runner_id, config.ENTRY_COOLDOWN_SEC):
+        logger.debug("Skip %s/%s: cooldown", market_id, runner_id)
+        return False
+    if (market_id, runner_id) in exposed_runners:
+        logger.debug("Skip %s/%s: API has open/matched offer", market_id, runner_id)
+        return False
+    return True
+
+
 def _get_best_back_lay(prices: list[dict]) -> tuple[Optional[float], Optional[float]]:
     """
     Extract best Back and best Lay odds from runner prices.
@@ -174,6 +195,7 @@ async def _hedge_with_retry(
                     pos = db.get_position_by_offer_id(back_offer_id) if back_offer_id else None
                     if pos:
                         db.update_position(pos["id"], "closed", profit)
+                    db.record_hedge_cooldown(market_id, runner_id)
                 return True, profit
         except MarketSuspendedError:
             logger.warning(
@@ -275,6 +297,7 @@ async def _hedge_lay_with_retry(
                     pos = db.get_position_by_offer_id(lay_offer_id) if lay_offer_id else None
                     if pos:
                         db.update_position(pos["id"], "closed", profit)
+                    db.record_hedge_cooldown(market_id, runner_id)
                 return True, profit
         except MarketSuspendedError:
             logger.warning(
@@ -529,12 +552,29 @@ async def _run_phase1(api: MatchbookAPI) -> None:
             )
         return
 
+    # Fetch current offers to avoid re-entering selections we already have exposure on
+    exposed_runners: set[tuple[int, int]] = set()
+    if not db.get_paper_trading():
+        try:
+            offers = await api.get_offers(statuses=["open", "matched"])
+            for o in offers:
+                mid, rid = o.get("market-id"), o.get("runner-id")
+                if mid is not None and rid is not None:
+                    exposed_runners.add((int(mid), int(rid)))
+        except Exception as e:
+            logger.warning("Could not fetch offers for pre-entry check: %s", e)
+
     db.insert_api_log(
         "response", "BOT", "Phase 1", None,
         request_body=f"Found {len(candidates)} candidates. Placing up to 5 Back orders (stake £{round(min(free_funds * 0.1, 5.0), 2)})",
     )
 
     for event, market, runner, best_back, best_lay in candidates[:5]:
+        market_id = market.get("id", 0)
+        runner_id = runner["id"]
+        if not _can_enter_selection(market_id, runner_id, exposed_runners):
+            continue
+
         # Place Back at best_back + (TICK_SIZE * BACK_TICKS_ABOVE)
         back_odds = _round_odds(best_back + config.TICK_SIZE * config.BACK_TICKS_ABOVE)
         stake = round(max_stake, 2)
@@ -600,6 +640,7 @@ async def _run_phase1(api: MatchbookAPI) -> None:
                         entry_stake=stake,
                         offer_id=offer.get("id"),
                     )
+                    exposed_runners.add((market_id, runner_id))
                     db.insert_api_log(
                         "response", "LIVE", "Phase 1 submit_offers", 200,
                         response_body=f"Order placed: status={offer.get('status')} offer_id={offer.get('id')}",
@@ -770,7 +811,23 @@ async def _run_phase2(api: MatchbookAPI) -> None:
         best = max(runners, key=lambda r: (r[6], -r[3]))  # max spread, then min back_odds
         phase2_candidates.append(best)
 
+    # Fetch current offers for pre-entry check
+    exposed_runners: set[tuple[int, int]] = set()
+    if not db.get_paper_trading():
+        try:
+            offers = await api.get_offers(statuses=["open", "matched"])
+            for o in offers:
+                mid, rid = o.get("market-id"), o.get("runner-id")
+                if mid is not None and rid is not None:
+                    exposed_runners.add((int(mid), int(rid)))
+        except Exception as e:
+            logger.warning("Could not fetch offers for Phase 2 pre-entry check: %s", e)
+
     for event, market, runner, back_odds, lay_odds, stake, _ in phase2_candidates:
+        market_id = market.get("id", 0)
+        runner_id = runner["id"]
+        if not _can_enter_selection(market_id, runner_id, exposed_runners):
+            continue
         try:
             if db.get_paper_trading():
                 db.insert_paper_trade(
