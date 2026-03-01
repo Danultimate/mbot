@@ -79,6 +79,13 @@ MAX_HEDGE_RETRIES = 30
 # Database path (override via DB_PATH env for Docker)
 DB_PATH = os.getenv("DB_PATH", "trading.db")
 
+# Liquidity filter: only trade in high-volume markets
+MIN_EVENT_VOLUME = 50_000   # £50k min event volume (excludes obscure leagues)
+MIN_MARKET_VOLUME = 50_000  # £50k min market volume
+LOW_VOLUME_CANCEL_THRESHOLD = 1_000  # Cancel open orders in markets below this
+# Optional: category IDs for top-tier (Premier League, etc.). Empty = volume only.
+ALLOWED_CATEGORY_IDS: list[int] = []
+
 # Pre-match only: exclude in-play/live events (volatile, fast-moving)
 # When True, only fetch events that start in the future
 PRE_MATCH_ONLY = True

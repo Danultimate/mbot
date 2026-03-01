@@ -337,6 +337,30 @@ class MatchbookAPI:
             logger.error("get_events timeout")
             raise
 
+    @staticmethod
+    def passes_liquidity_filter(
+        event: dict,
+        market: dict,
+        min_event_volume: float,
+        min_market_volume: float,
+        allowed_category_ids: Optional[list[int]] = None,
+    ) -> bool:
+        """
+        Check if event/market meets liquidity thresholds.
+        Event and market have a 'volume' field (total matched, in account currency).
+        """
+        ev_vol = float(event.get("volume", 0) or 0)
+        mkt_vol = float(market.get("volume", 0) or 0)
+        if ev_vol < min_event_volume or mkt_vol < min_market_volume:
+            return False
+        if not allowed_category_ids:
+            return True
+        cats = event.get("category-id") or []
+        if isinstance(cats, (int, float)):
+            cats = [cats]
+        event_cats = {int(c) for c in cats if c is not None}
+        return bool(event_cats & set(allowed_category_ids))
+
     async def submit_offers(self, offers: list[dict]) -> list[dict]:
         """
         Submit one or more offers (Back or Lay orders).

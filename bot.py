@@ -83,6 +83,17 @@ def _lay_liability(lay_stake: float, lay_odds: float) -> float:
     return lay_stake * (lay_odds - 1)
 
 
+def _passes_liquidity_filter(event: dict, market: dict) -> bool:
+    """Strict liquidity filter. Uses config thresholds and optional ALLOWED_CATEGORY_IDS."""
+    return MatchbookAPI.passes_liquidity_filter(
+        event,
+        market,
+        config.MIN_EVENT_VOLUME,
+        config.MIN_MARKET_VOLUME,
+        getattr(config, "ALLOWED_CATEGORY_IDS", None) or [],
+    )
+
+
 def _can_enter_selection(
     market_id: int,
     runner_id: int,
@@ -364,6 +375,47 @@ def _parse_event_start(start_str: Optional[str]) -> Optional[datetime]:
         return None
 
 
+async def _cancel_low_volume_orders(api: MatchbookAPI) -> None:
+    """
+    Cancel any OPEN orders in markets with volume < LOW_VOLUME_CANCEL_THRESHOLD (£1k).
+    Frees bankroll stuck in obscure/low-liquidity markets.
+    """
+    if db.get_paper_trading():
+        return
+    offers = await api.get_offers(statuses=["open"])
+    open_offers = [o for o in offers if o.get("status") == "open"]
+    if not open_offers:
+        return
+    event_ids = list({o.get("event-id") for o in open_offers if o.get("event-id")})
+    if not event_ids:
+        return
+    try:
+        events = await api.get_events(event_ids=event_ids, include_prices=False)
+    except Exception as e:
+        logger.warning("Could not fetch events for low-volume cancel: %s", e)
+        return
+    market_volume: dict[int, float] = {}
+    for ev in events:
+        for m in ev.get("markets", []):
+            mid = m.get("id")
+            if mid is not None:
+                market_volume[int(mid)] = float(m.get("volume", 0) or 0)
+    to_cancel = []
+    for o in open_offers:
+        mid = o.get("market-id")
+        if mid is None:
+            continue
+        vol = market_volume.get(int(mid), 0)
+        if vol < config.LOW_VOLUME_CANCEL_THRESHOLD:
+            to_cancel.append(o.get("id"))
+    if to_cancel:
+        try:
+            await api.cancel_offers(offer_ids=to_cancel)
+            logger.info("Cancelled %d orders in low-volume markets (<£%.0f)", len(to_cancel), config.LOW_VOLUME_CANCEL_THRESHOLD)
+        except Exception as e:
+            logger.warning("Failed to cancel low-volume orders: %s", e)
+
+
 async def _close_events_before_start(api: MatchbookAPI) -> None:
     """
     When pre-match only: cancel open orders and hedge matched positions
@@ -462,7 +514,8 @@ async def _run_phase1(api: MatchbookAPI) -> None:
 
     db.insert_api_log(
         "response", "BOT", "get_events", None,
-        request_body=f"Phase 1: got {len(events)} events (sport_ids={sport_ids}, market_types={market_types})",
+        request_body=f"Phase 1: {len(events)} events (sport_ids={sport_ids}). "
+        f"Liquidity: min £{config.MIN_EVENT_VOLUME:,} event / £{config.MIN_MARKET_VOLUME:,} market.",
     )
 
     # Build list of (event, market, runner) with valid prices
@@ -493,6 +546,8 @@ async def _run_phase1(api: MatchbookAPI) -> None:
             if not _market_matches(market.get("market-type", "")):
                 continue
             if market.get("status") != "open":
+                continue
+            if not _passes_liquidity_filter(event, market):
                 continue
             key = (event.get("id", 0), market.get("id", 0))
             for runner in market.get("runners", []):
@@ -802,6 +857,8 @@ async def _run_phase2(api: MatchbookAPI) -> None:
                 continue
             if market.get("status") != "open":
                 continue
+            if not _passes_liquidity_filter(event, market):
+                continue
             key = (event.get("id", 0), market.get("id", 0))
             for runner in market.get("runners", []):
                 if runner.get("status") != "open":
@@ -931,6 +988,9 @@ async def _main_loop() -> None:
 
         # Pre-match only: close orders for events starting soon
         await _close_events_before_start(api)
+
+        # Cancel open orders stuck in low-volume markets (<£1k)
+        await _cancel_low_volume_orders(api)
 
         # Daily stop-loss: pause if today's loss exceeds limit
         if db.get_stop_loss_triggered():
