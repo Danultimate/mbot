@@ -57,8 +57,12 @@ MARKET_TYPES = ["one_x_two", "money_line", "over_under_25"]
 
 # Tick size for decimal odds (e.g. 2.0 -> 2.02 -> 2.04)
 TICK_SIZE = 0.02
-# Phase 1: place Back order this many ticks above best available
+# Entry: Back orders placed as maker (1-2 ticks above best Back)
 BACK_TICKS_ABOVE = 2
+# Exit hedge: Lay placed at best_lay - N ticks (maker). Time Stop overrides.
+HEDGE_LAY_TICKS_BELOW = 1
+# Exit hedge: Back placed at best_back - N ticks (maker). Time Stop overrides.
+HEDGE_BACK_TICKS_BELOW = 1
 # Phase 2: spread harvesting - Back at best+1 tick, Lay at best-1 tick
 PHASE2_BACK_TICKS_ABOVE = 1
 PHASE2_LAY_TICKS_BELOW = 1

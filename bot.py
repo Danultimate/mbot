@@ -141,18 +141,29 @@ async def _hedge_with_retry(
     runner_name: str,
     market_id: int = 0,
     back_offer_id: Optional[int] = None,
+    emergency_close: bool = False,
 ) -> tuple[bool, Optional[float]]:
     """
     Place Green Up Lay order, retrying on Market Suspended every 2 seconds.
-    Returns (success, locked_in_profit). Recalculates lay_odds from live prices on each retry.
+    Maker by default: Lay at best_lay - ticks (unmatched). Time Stop uses emergency_close=True to cross.
+    Returns (success, locked_in_profit).
     """
     for attempt in range(config.MAX_HEDGE_RETRIES):
         try:
-            lay_odds = await _fetch_lay_odds(api, runner_id)
-            if lay_odds is None or lay_odds <= 0:
+            best_lay = await _fetch_lay_odds(api, runner_id)
+            if best_lay is None or best_lay <= 0:
                 logger.warning("No valid lay odds for hedge, retrying...")
                 await asyncio.sleep(config.HEDGE_RETRY_INTERVAL_SEC)
                 continue
+
+            # Maker: place at best_lay - ticks (or lower). Emergency: place at best_lay (take).
+            if emergency_close:
+                lay_odds = best_lay
+            else:
+                ticks_below = max(1, config.HEDGE_LAY_TICKS_BELOW)
+                lay_odds = _round_odds(best_lay - config.TICK_SIZE * ticks_below)
+                if lay_odds < 1.02:  # Avoid invalid odds on short prices
+                    lay_odds = best_lay
 
             lay_stake = _green_up_lay_stake(back_stake, back_odds, lay_odds)
             if lay_stake <= 0:
@@ -243,18 +254,29 @@ async def _hedge_lay_with_retry(
     runner_name: str,
     market_id: int = 0,
     lay_offer_id: Optional[int] = None,
+    emergency_close: bool = False,
 ) -> tuple[bool, Optional[float]]:
     """
     Place Green Up Back order to close a Lay position.
+    Maker by default: Back at best_back - ticks (unmatched). Time Stop uses emergency_close=True to cross.
     Returns (success, locked_in_profit).
     """
     for attempt in range(config.MAX_HEDGE_RETRIES):
         try:
-            back_odds = await _fetch_back_odds(api, runner_id)
-            if back_odds is None or back_odds <= 0:
+            best_back = await _fetch_back_odds(api, runner_id)
+            if best_back is None or best_back <= 0:
                 logger.warning("No valid back odds for Lay hedge, retrying...")
                 await asyncio.sleep(config.HEDGE_RETRY_INTERVAL_SEC)
                 continue
+
+            # Maker: place at best_back - ticks (or lower). Emergency: place at best_back (take).
+            if emergency_close:
+                back_odds = best_back
+            else:
+                ticks_below = max(1, config.HEDGE_BACK_TICKS_BELOW)
+                back_odds = _round_odds(best_back - config.TICK_SIZE * ticks_below)
+                if back_odds < 1.02:  # Avoid invalid odds on short prices
+                    back_odds = best_back
 
             back_stake = _green_up_back_stake(lay_stake, lay_odds, back_odds)
             if back_stake <= 0:
@@ -408,6 +430,7 @@ async def _close_events_before_start(api: MatchbookAPI) -> None:
                         api, runner_id, stake, odds,
                         o.get("market-name", ""), o.get("runner-name", ""),
                         market_id=market_id, back_offer_id=o.get("id"),
+                        emergency_close=True,  # Time Stop: cross spread for immediate exit
                     )
             elif o.get("side") == "lay":
                 if not db.get_paper_trading():
@@ -415,6 +438,7 @@ async def _close_events_before_start(api: MatchbookAPI) -> None:
                         api, runner_id, stake, odds,
                         o.get("market-name", ""), o.get("runner-name", ""),
                         market_id=market_id, lay_offer_id=o.get("id"),
+                        emergency_close=True,  # Time Stop: cross spread for immediate exit
                     )
             await asyncio.sleep(config.RATE_LIMIT_DELAY_MS / 1000.0)
 
@@ -575,8 +599,9 @@ async def _run_phase1(api: MatchbookAPI) -> None:
         if not _can_enter_selection(market_id, runner_id, exposed_runners):
             continue
 
-        # Place Back at best_back + (TICK_SIZE * BACK_TICKS_ABOVE)
-        back_odds = _round_odds(best_back + config.TICK_SIZE * config.BACK_TICKS_ABOVE)
+        # Maker: Back at least 1-2 ticks above best Back (provide liquidity, wait for market)
+        ticks_above = max(1, config.BACK_TICKS_ABOVE)
+        back_odds = _round_odds(best_back + config.TICK_SIZE * ticks_above)
         stake = round(max_stake, 2)
 
         try:
@@ -589,7 +614,7 @@ async def _run_phase1(api: MatchbookAPI) -> None:
                     odds=back_odds,
                     stake=stake,
                     phase=1,
-                    reason="Phase 1: Back at discount (2 ticks above best)",
+                    reason="Phase 1: Maker Back (2 ticks above best)",
                 )
                 db.insert_api_log(
                     "request", "PAPER", "Phase 1 Back", None,
