@@ -115,6 +115,14 @@ def init_db() -> None:
                 closed_at TEXT NOT NULL,
                 PRIMARY KEY (market_id, runner_id)
             );
+
+            CREATE TABLE IF NOT EXISTS closed_markets (
+                market_id INTEGER NOT NULL,
+                event_id INTEGER NOT NULL,
+                closed_date TEXT NOT NULL,
+                PRIMARY KEY (market_id, closed_date)
+            );
+            CREATE INDEX IF NOT EXISTS idx_closed_markets_date ON closed_markets(closed_date);
         """)
         conn.commit()
     finally:
@@ -343,6 +351,35 @@ def is_on_cooldown(market_id: int, runner_id: int, cooldown_sec: float = 60) -> 
             return 0 <= elapsed < cooldown_sec
         except (ValueError, TypeError):
             return False
+    finally:
+        conn.close()
+
+
+def insert_closed_market(market_id: int, event_id: int = 0) -> None:
+    """Record market as completed for today (One-and-Done: no re-entry this day)."""
+    conn = get_connection()
+    try:
+        today = datetime.utcnow().date().isoformat()
+        conn.execute(
+            """INSERT OR IGNORE INTO closed_markets (market_id, event_id, closed_date)
+               VALUES (?, ?, ?)""",
+            (market_id, event_id, today),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def is_market_closed_today(market_id: int) -> bool:
+    """Return True if this market was completed (full cycle closed) today. One-and-Done rule."""
+    conn = get_connection()
+    try:
+        today = datetime.utcnow().date().isoformat()
+        row = conn.execute(
+            "SELECT 1 FROM closed_markets WHERE market_id = ? AND closed_date = ?",
+            (market_id, today),
+        ).fetchone()
+        return row is not None
     finally:
         conn.close()
 

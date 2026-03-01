@@ -151,6 +151,7 @@ async def _hedge_with_retry(
     market_name: str,
     runner_name: str,
     market_id: int = 0,
+    event_id: Optional[int] = None,
     back_offer_id: Optional[int] = None,
     emergency_close: bool = False,
 ) -> tuple[bool, Optional[float]]:
@@ -218,6 +219,7 @@ async def _hedge_with_retry(
                     if pos:
                         db.update_position(pos["id"], "closed", profit)
                     db.record_hedge_cooldown(market_id, runner_id)
+                    db.insert_closed_market(market_id, event_id or 0)
                 return True, profit
         except MarketSuspendedError:
             logger.warning(
@@ -264,6 +266,7 @@ async def _hedge_lay_with_retry(
     market_name: str,
     runner_name: str,
     market_id: int = 0,
+    event_id: Optional[int] = None,
     lay_offer_id: Optional[int] = None,
     emergency_close: bool = False,
 ) -> tuple[bool, Optional[float]]:
@@ -331,6 +334,7 @@ async def _hedge_lay_with_retry(
                     if pos:
                         db.update_position(pos["id"], "closed", profit)
                     db.record_hedge_cooldown(market_id, runner_id)
+                    db.insert_closed_market(market_id, event_id or 0)
                 return True, profit
         except MarketSuspendedError:
             logger.warning(
@@ -504,7 +508,7 @@ async def _close_events_before_start(api: MatchbookAPI) -> None:
                     await _hedge_with_retry(
                         api, runner_id, stake, odds,
                         o.get("market-name", ""), o.get("runner-name", ""),
-                        market_id=market_id, back_offer_id=o.get("id"),
+                        market_id=market_id, event_id=event_id, back_offer_id=o.get("id"),
                         emergency_close=True,  # Time Stop: cross spread for immediate exit
                     )
             elif o.get("side") == "lay":
@@ -512,7 +516,7 @@ async def _close_events_before_start(api: MatchbookAPI) -> None:
                     await _hedge_lay_with_retry(
                         api, runner_id, stake, odds,
                         o.get("market-name", ""), o.get("runner-name", ""),
-                        market_id=market_id, lay_offer_id=o.get("id"),
+                        market_id=market_id, event_id=event_id, lay_offer_id=o.get("id"),
                         emergency_close=True,  # Time Stop: cross spread for immediate exit
                     )
             await asyncio.sleep(config.RATE_LIMIT_DELAY_MS / 1000.0)
@@ -572,7 +576,10 @@ async def _run_phase1(api: MatchbookAPI) -> None:
                 continue
             if not _passes_liquidity_filter(event, market):
                 continue
-            key = (event.get("id", 0), market.get("id", 0))
+            market_id = market.get("id", 0)
+            if db.is_market_closed_today(market_id):
+                continue  # One-and-Done: already completed full cycle on this market today
+            key = (event.get("id", 0), market_id)
             for runner in market.get("runners", []):
                 if runner.get("status") != "open":
                     continue
@@ -806,6 +813,7 @@ async def hedge_all_matched_positions(
         key = (int(market_id or 0), int(runner_id or 0))
         market_name = offer.get("market-name", "")
         runner_name = offer.get("runner-name", "")
+        event_id = offer.get("event-id") or 0
         if offer.get("side") == "back":
             if key in open_lay_runners:
                 continue  # Exit state check: Lay hedge already pending, don't stack
@@ -813,7 +821,7 @@ async def hedge_all_matched_positions(
                 await _hedge_with_retry(
                     api, runner_id, stake, odds,
                     market_name, runner_name,
-                    market_id=market_id, back_offer_id=offer.get("id"),
+                    market_id=market_id, event_id=event_id, back_offer_id=offer.get("id"),
                 )
         elif offer.get("side") == "lay":
             if key in open_back_runners:
@@ -822,7 +830,7 @@ async def hedge_all_matched_positions(
                 await _hedge_lay_with_retry(
                     api, runner_id, stake, odds,
                     market_name, runner_name,
-                    market_id=market_id, lay_offer_id=offer.get("id"),
+                    market_id=market_id, event_id=event_id, lay_offer_id=offer.get("id"),
                 )
         count += 1
         await asyncio.sleep(config.RATE_LIMIT_DELAY_MS / 1000.0)
@@ -903,7 +911,10 @@ async def _run_phase2(api: MatchbookAPI) -> None:
                 continue
             if not _passes_liquidity_filter(event, market):
                 continue
-            key = (event.get("id", 0), market.get("id", 0))
+            market_id = market.get("id", 0)
+            if db.is_market_closed_today(market_id):
+                continue  # One-and-Done: already completed full cycle on this market today
+            key = (event.get("id", 0), market_id)
             for runner in market.get("runners", []):
                 if runner.get("status") != "open":
                     continue
