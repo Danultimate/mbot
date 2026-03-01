@@ -211,11 +211,12 @@ class MatchbookAPI:
         Make HTTP request. On 401, clear session, login, retry once.
         Returns (status_code, body).
         """
+        req_headers = kwargs.pop("headers", None) or self._auth_headers()
         req_body = json.dumps(kwargs.get("json")) if kwargs.get("json") else (str(kwargs.get("params")) if kwargs.get("params") else None)
         db.insert_api_log("request", method, url, request_body=req_body)
         session = await self._ensure_session()
         async with session.request(
-            method, url, headers=self._auth_headers(), **kwargs
+            method, url, headers=req_headers, **kwargs
         ) as resp:
             body = await resp.text()
             await self._rate_limit()
@@ -225,7 +226,7 @@ class MatchbookAPI:
                 await self.login()
                 db.insert_api_log("request", method, url, request_body="(retry after 401)")
                 async with session.request(
-                    method, url, headers=self._auth_headers(), **kwargs
+                    method, url, headers=req_headers, **kwargs
                 ) as retry_resp:
                     retry_body = await retry_resp.text()
                     await self._rate_limit()
