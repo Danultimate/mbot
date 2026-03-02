@@ -497,11 +497,14 @@ def main():
         trade_rows = [
             {
                 "Date": (t.get("timestamp") or "")[:19],
+                "Event": t.get("event_name", ""),
                 "Market": t.get("market_name", ""),
                 "Selection": t.get("runner_name", ""),
                 "Side": (t.get("side") or "").capitalize(),
                 "Odds": t.get("odds"),
                 "Stake": t.get("stake"),
+                "Phase": t.get("phase"),
+                "Logic": t.get("reason", ""),
                 "Profit (£)": f"£{t['profit_loss']:.2f}" if t.get("profit_loss") is not None else "-",
             }
             for t in trades

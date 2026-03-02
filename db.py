@@ -174,6 +174,19 @@ def init_db() -> None:
             conn.commit()
         except sqlite3.OperationalError:
             pass  # column already exists
+        # Migration: add event_name and reason to trades (unify with paper schema)
+        for col in ("event_name", "reason"):
+            try:
+                conn.execute(f"ALTER TABLE trades ADD COLUMN {col} TEXT DEFAULT ''")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
+        # Migration: add event_name to pending_hedge_confirmations
+        try:
+            conn.execute("ALTER TABLE pending_hedge_confirmations ADD COLUMN event_name TEXT DEFAULT ''")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
     finally:
         conn.close()
 
@@ -190,14 +203,16 @@ def insert_trade(
     offer_id: Optional[int] = None,
     phase: Optional[int] = None,
     profit_loss: Optional[float] = None,
+    event_name: str = "",
+    reason: str = "",
 ) -> int:
-    """Insert a trade record. Returns the new row id."""
+    """Insert a trade record. Returns the new row id. Schema matches paper_trades (Event, Phase, Logic)."""
     conn = get_connection()
     try:
         cur = conn.execute(
             """INSERT INTO trades (timestamp, market_id, runner_id, market_name, runner_name,
-               side, odds, stake, status, offer_id, phase, profit_loss)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               side, odds, stake, status, offer_id, phase, profit_loss, event_name, reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 datetime.utcnow().isoformat(),
                 market_id,
@@ -211,6 +226,8 @@ def insert_trade(
                 offer_id,
                 phase,
                 profit_loss,
+                event_name or "",
+                reason or "",
             ),
         )
         conn.commit()
@@ -608,6 +625,7 @@ def insert_pending_hedge_confirmation(
     event_id: int,
     position_id: Optional[int],
     back_offer_id: Optional[int],
+    event_name: str = "",
 ) -> int:
     """Record hedge order placed; will confirm via API poll before logging complete."""
     conn = get_connection()
@@ -615,8 +633,8 @@ def insert_pending_hedge_confirmation(
         cur = conn.execute(
             """INSERT INTO pending_hedge_confirmations
                (hedge_offer_id, market_id, runner_id, side, stake, odds, market_name,
-                runner_name, event_id, position_id, back_offer_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                runner_name, event_id, position_id, back_offer_id, event_name, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 hedge_offer_id,
                 market_id,
@@ -629,6 +647,7 @@ def insert_pending_hedge_confirmation(
                 event_id,
                 position_id,
                 back_offer_id,
+                event_name or "",
                 datetime.utcnow().isoformat(),
             ),
         )
@@ -645,7 +664,7 @@ def get_pending_hedge_confirmations() -> list[dict]:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """SELECT id, hedge_offer_id, market_id, runner_id, side, stake, odds,
-                      market_name, runner_name, event_id, position_id, back_offer_id
+                      market_name, runner_name, event_id, position_id, back_offer_id, event_name
                FROM pending_hedge_confirmations"""
         ).fetchall()
         return [dict(r) for r in rows]
@@ -664,12 +683,12 @@ def delete_pending_hedge_confirmation(pending_id: int) -> None:
 
 
 def get_trades(limit: int = 100) -> list[dict]:
-    """Return trade history (date, market, selection, side, odds, stake, profit_loss)."""
+    """Return trade history. Schema matches paper_trades (Event, Phase, Logic)."""
     conn = get_connection()
     try:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            """SELECT timestamp, market_name, runner_name, side, odds, stake, profit_loss
+            """SELECT timestamp, event_name, market_name, runner_name, side, odds, stake, phase, reason, profit_loss
                FROM trades ORDER BY timestamp DESC LIMIT ?""",
             (limit,),
         ).fetchall()

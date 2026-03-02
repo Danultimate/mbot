@@ -155,6 +155,7 @@ async def _hedge_with_retry(
     runner_name: str,
     market_id: int = 0,
     event_id: Optional[int] = None,
+    event_name: str = "",
     back_offer_id: Optional[int] = None,
     emergency_close: bool = False,
 ) -> tuple[bool, Optional[float]]:
@@ -219,6 +220,7 @@ async def _hedge_with_retry(
                         event_id=event_id or 0,
                         position_id=pos["id"] if pos else None,
                         back_offer_id=back_offer_id,
+                        event_name=event_name,
                     )
                 return True, profit
         except MarketSuspendedError:
@@ -267,6 +269,7 @@ async def _hedge_lay_with_retry(
     runner_name: str,
     market_id: int = 0,
     event_id: Optional[int] = None,
+    event_name: str = "",
     lay_offer_id: Optional[int] = None,
     emergency_close: bool = False,
 ) -> tuple[bool, Optional[float]]:
@@ -331,6 +334,7 @@ async def _hedge_lay_with_retry(
                         event_id=event_id or 0,
                         position_id=pos["id"] if pos else None,
                         back_offer_id=lay_offer_id,
+                        event_name=event_name,
                     )
                 return True, profit
         except MarketSuspendedError:
@@ -440,21 +444,22 @@ async def _cancel_low_volume_orders(api: MatchbookAPI) -> None:
             logger.warning("Failed to cancel low-volume orders: %s", e)
 
 
-async def _close_events_before_start(api: MatchbookAPI) -> None:
+async def _close_events_before_start(api: MatchbookAPI) -> bool:
     """
     When pre-match only: cancel open orders and hedge matched positions
     for events starting within close_before_start_minutes.
+    Returns True if any hedge order was placed (for API latency buffer).
     """
     if not db.get_pre_match_only():
-        return
+        return False
 
     offers = await api.get_offers(statuses=["open", "matched"])
     if not offers:
-        return
+        return False
 
     event_ids = list({o.get("event-id") for o in offers if o.get("event-id")})
     if not event_ids:
-        return
+        return False
 
     events = await api.get_events(
         event_ids=event_ids,
@@ -472,8 +477,9 @@ async def _close_events_before_start(api: MatchbookAPI) -> None:
             events_to_close.append(ev.get("id"))
 
     if not events_to_close:
-        return
+        return False
 
+    order_placed = False
     for event_id in events_to_close:
         event_offers = [o for o in offers if o.get("event-id") == event_id]
         if not event_offers:
@@ -502,24 +508,33 @@ async def _close_events_before_start(api: MatchbookAPI) -> None:
             market_id = o.get("market-id") or 0
             if o.get("side") == "back":
                 if not db.get_paper_trading():
-                    await _hedge_with_retry(
+                    ok, _ = await _hedge_with_retry(
                         api, runner_id, stake, odds,
                         o.get("market-name", ""), o.get("runner-name", ""),
-                        market_id=market_id, event_id=event_id, back_offer_id=o.get("id"),
+                        market_id=market_id, event_id=event_id,
+                        event_name=o.get("event-name", ""),
+                        back_offer_id=o.get("id"),
                         emergency_close=True,  # Time Stop: cross spread for immediate exit
                     )
+                    if ok:
+                        order_placed = True
             elif o.get("side") == "lay":
                 if not db.get_paper_trading():
-                    await _hedge_lay_with_retry(
+                    ok, _ = await _hedge_lay_with_retry(
                         api, runner_id, stake, odds,
                         o.get("market-name", ""), o.get("runner-name", ""),
-                        market_id=market_id, event_id=event_id, lay_offer_id=o.get("id"),
+                        market_id=market_id, event_id=event_id,
+                        event_name=o.get("event-name", ""),
+                        lay_offer_id=o.get("id"),
                         emergency_close=True,  # Time Stop: cross spread for immediate exit
                     )
+                    if ok:
+                        order_placed = True
             await asyncio.sleep(config.RATE_LIMIT_DELAY_MS / 1000.0)
+    return order_placed
 
 
-async def _run_phase1(api: MatchbookAPI) -> None:
+async def _run_phase1(api: MatchbookAPI) -> bool:
     """
     Phase 1: Directional Scalping ("Buy the Dip").
     Bankroll £25–£200. Only place Back orders at a discount (2 ticks above best).
@@ -608,7 +623,7 @@ async def _run_phase1(api: MatchbookAPI) -> None:
     if max_stake < 2.0:
         logger.info("Insufficient funds for Phase 1 (need >= £2)")
         db.insert_api_log("response", "BOT", "Phase 1", None, request_body="Skipped: insufficient funds (need free_funds >= £20)")
-        return
+        return False
 
     if not candidates:
         # Diagnose why: count events, markets, runners, and runners with prices
@@ -662,7 +677,7 @@ async def _run_phase1(api: MatchbookAPI) -> None:
                 "response", "BOT", "Phase 1", None,
                 request_body=f"No candidates. Events={n_events}, markets={n_markets}, runners={n_runners}, with_prices={n_with_prices}. Market types in data: {market_types_seen}. Need: {market_types}",
             )
-        return
+        return False
 
     # Rule 1 (Unmatched State Check): before ANY Phase 1 entry, check for existing orders.
     # Must include BOTH matched AND unmatched/pending. Skip if selection already has an order.
@@ -684,6 +699,7 @@ async def _run_phase1(api: MatchbookAPI) -> None:
         request_body=f"Found {len(candidates)} candidates. Placing up to 5 Back orders (stake £{round(min(free_funds * 0.1, 5.0), 2)})",
     )
 
+    order_placed = False
     for event, market, runner, best_back, best_lay in candidates[:5]:
         market_id = market.get("id", 0)
         runner_id = runner["id"]
@@ -758,6 +774,8 @@ async def _run_phase1(api: MatchbookAPI) -> None:
                         status=offer.get("status", "open"),
                         offer_id=offer.get("id"),
                         phase=1,
+                        event_name=event.get("name", ""),
+                        reason="Phase 1: Maker Back (2 ticks above best)",
                     )
                     db.insert_position(
                         market_id=market.get("id"),
@@ -780,6 +798,7 @@ async def _run_phase1(api: MatchbookAPI) -> None:
                         back_odds,
                         stake,
                     )
+                    order_placed = True
                 else:
                     db.insert_api_log("response", "LIVE", "Phase 1 submit_offers", None, error="submit_offers returned empty")
         except MarketSuspendedError:
@@ -793,6 +812,7 @@ async def _run_phase1(api: MatchbookAPI) -> None:
 
     # Poll for matched offers and hedge (Green Up)
     await hedge_all_matched_positions(api)
+    return order_placed
 
 
 def _runners_with_open_offers(offers: list[dict], side: str) -> set[tuple[int, int]]:
@@ -844,6 +864,8 @@ async def _process_hedge_confirmations(offers: list[dict]) -> None:
             offer_id=oid,
             phase=1,
             profit_loss=profit,
+            event_name=pend.get("event_name", ""),
+            reason="Hedge: Lay exit" if side == "lay" else "Hedge: Back exit",
         )
         if pos:
             db.update_position(pos["id"], "closed", profit)
@@ -862,13 +884,14 @@ async def _process_hedge_confirmations(offers: list[dict]) -> None:
 
 async def hedge_all_matched_positions(
     api: MatchbookAPI, hedge_all: bool = False
-) -> None:
+) -> bool:
     """
     Fetch matched offers and hedge each (Back with Lay, Lay with Back).
     Exit state check: never place a hedge if an open hedge order already exists.
     hedge_all=True: process all matched (panic hedge). False: one per call (bot cycle).
     Rule 2: Process pending hedge confirmations (API source of truth) before placing new hedges.
     """
+    hedge_placed = False
     if not db.get_paper_trading():
         offers = await api.get_offers(statuses=["open", "matched"])
         await _process_hedge_confirmations(offers)
@@ -894,26 +917,35 @@ async def hedge_all_matched_positions(
             if key in open_lay_runners:
                 continue  # Exit state check: Lay hedge already pending, don't stack
             if not db.get_paper_trading():
-                await _hedge_with_retry(
+                ok, _ = await _hedge_with_retry(
                     api, runner_id, stake, odds,
                     market_name, runner_name,
-                    market_id=market_id, event_id=event_id, back_offer_id=offer.get("id"),
+                    market_id=market_id, event_id=event_id,
+                    event_name=offer.get("event-name", ""),
+                    back_offer_id=offer.get("id"),
                 )
+                if ok:
+                    hedge_placed = True
         elif offer.get("side") == "lay":
             if key in open_back_runners:
                 continue  # Exit state check: Back hedge already pending, don't stack
             if not db.get_paper_trading():
-                await _hedge_lay_with_retry(
+                ok, _ = await _hedge_lay_with_retry(
                     api, runner_id, stake, odds,
                     market_name, runner_name,
-                    market_id=market_id, event_id=event_id, lay_offer_id=offer.get("id"),
+                    market_id=market_id, event_id=event_id,
+                    event_name=offer.get("event-name", ""),
+                    lay_offer_id=offer.get("id"),
                 )
+                if ok:
+                    hedge_placed = True
         count += 1
         await asyncio.sleep(config.RATE_LIMIT_DELAY_MS / 1000.0)
         if not hedge_all:
             break  # One per bot cycle
     if hedge_all and count > 0:
         logger.info("Panic hedge: closed %d matched position(s)", count)
+    return hedge_placed
 
 
 async def _process_paper_simulated_fills(api: MatchbookAPI) -> None:
@@ -1007,7 +1039,7 @@ async def _fetch_lay_odds(api: MatchbookAPI, runner_id: int) -> Optional[float]:
     return None
 
 
-async def _run_phase2(api: MatchbookAPI) -> None:
+async def _run_phase2(api: MatchbookAPI) -> bool:
     """
     Phase 2: Market Making / Spread Harvesting.
     Bankroll >= £200. Place Back and Lay simultaneously at spread edges.
@@ -1187,8 +1219,11 @@ async def _run_phase2(api: MatchbookAPI) -> None:
                 ]
                 result = await api.submit_offers(offers)
                 if result:
+                    db.insert_blacklisted_market(market_id, event.get("id", 0))  # Rule 3: instant blacklist on Phase 2 Lay
                     db.insert_api_log("response", "LIVE", "Phase 2 submit_offers", 200, response_body=f"Orders placed: {len(result)} offers")
                     logger.info("Phase 2 orders placed: %s Back %.2f Lay %.2f @ %.2f", runner.get("name"), back_odds, lay_odds, stake)
+                    await asyncio.sleep(config.RATE_LIMIT_DELAY_MS / 1000.0)
+                    return True  # One market per cycle, order placed
                 else:
                     db.insert_api_log("response", "LIVE", "Phase 2 submit_offers", None, error="submit_offers returned empty")
         except MarketSuspendedError:
@@ -1198,7 +1233,7 @@ async def _run_phase2(api: MatchbookAPI) -> None:
             logger.exception("Phase 2 order failed: %s", e)
             db.insert_api_log("response", "LIVE", "Phase 2", None, error=str(e))
         await asyncio.sleep(config.RATE_LIMIT_DELAY_MS / 1000.0)
-        return  # One market per cycle
+        return False  # One market per cycle, no order placed
 
 
 async def _main_loop() -> None:
@@ -1223,7 +1258,7 @@ async def _main_loop() -> None:
             return
 
         # Pre-match only: close orders for events starting soon
-        await _close_events_before_start(api)
+        order_placed = await _close_events_before_start(api)
 
         # Cancel open orders stuck in low-volume markets (<£1k)
         await _cancel_low_volume_orders(api)
@@ -1257,12 +1292,18 @@ async def _main_loop() -> None:
         await _process_paper_simulated_fills(api)
 
         if phase == 1:
-            await _run_phase1(api)
+            order_placed = order_placed or await _run_phase1(api)
         else:
-            await _run_phase2(api)
+            order_placed = order_placed or await _run_phase2(api)
 
         # Hedge any matched positions (Back or Lay) from this or previous cycles
-        await hedge_all_matched_positions(api)
+        hedge_placed = await hedge_all_matched_positions(api)
+        order_placed = order_placed or hedge_placed
+
+        # API latency buffer: wait 3s after Live order so Matchbook can update status
+        if order_placed and not db.get_paper_trading():
+            logger.info("Order placed: waiting 3s for Matchbook API to update status")
+            await asyncio.sleep(3)
 
     finally:
         await api.close()
