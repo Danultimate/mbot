@@ -123,6 +123,14 @@ def init_db() -> None:
                 PRIMARY KEY (market_id, closed_date)
             );
             CREATE INDEX IF NOT EXISTS idx_closed_markets_date ON closed_markets(closed_date);
+
+            CREATE TABLE IF NOT EXISTS blacklisted_markets (
+                market_id INTEGER NOT NULL,
+                event_id INTEGER NOT NULL,
+                blacklisted_at TEXT NOT NULL,
+                PRIMARY KEY (market_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_blacklisted_markets_market_id ON blacklisted_markets(market_id);
         """)
         conn.commit()
     finally:
@@ -378,6 +386,34 @@ def is_market_closed_today(market_id: int) -> bool:
         row = conn.execute(
             "SELECT 1 FROM closed_markets WHERE market_id = ? AND closed_date = ?",
             (market_id, today),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def insert_blacklisted_market(market_id: int, event_id: int = 0) -> None:
+    """Record market as blacklisted (successful Lay exit). Never re-enter this market."""
+    conn = get_connection()
+    try:
+        now = datetime.utcnow().isoformat()
+        conn.execute(
+            """INSERT OR REPLACE INTO blacklisted_markets (market_id, event_id, blacklisted_at)
+               VALUES (?, ?, ?)""",
+            (market_id, event_id, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def is_market_blacklisted(market_id: int) -> bool:
+    """Return True if this market is blacklisted (had a successful Lay exit). Skip entry."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM blacklisted_markets WHERE market_id = ?",
+            (market_id,),
         ).fetchone()
         return row is not None
     finally:

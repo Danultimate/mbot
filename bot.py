@@ -103,6 +103,9 @@ def _can_enter_selection(
     Strict pre-entry check: zero open/unmatched positions for this market/selection.
     Returns False if we have exposure or are on cooldown.
     """
+    if db.is_market_blacklisted(market_id):
+        logger.debug("Skip %s/%s: market blacklisted (Lay exit)", market_id, runner_id)
+        return False
     if db.has_open_position_for_runner(market_id, runner_id):
         logger.debug("Skip %s/%s: open position", market_id, runner_id)
         return False
@@ -220,6 +223,7 @@ async def _hedge_with_retry(
                         db.update_position(pos["id"], "closed", profit)
                     db.record_hedge_cooldown(market_id, runner_id)
                     db.insert_closed_market(market_id, event_id or 0)
+                    db.insert_blacklisted_market(market_id, event_id or 0)  # Lay exit: never re-enter
                 return True, profit
         except MarketSuspendedError:
             logger.warning(
@@ -335,6 +339,7 @@ async def _hedge_lay_with_retry(
                         db.update_position(pos["id"], "closed", profit)
                     db.record_hedge_cooldown(market_id, runner_id)
                     db.insert_closed_market(market_id, event_id or 0)
+                    db.insert_blacklisted_market(market_id, event_id or 0)  # Lay exit: never re-enter
                 return True, profit
         except MarketSuspendedError:
             logger.warning(
@@ -577,6 +582,8 @@ async def _run_phase1(api: MatchbookAPI) -> None:
             if not _passes_liquidity_filter(event, market):
                 continue
             market_id = market.get("id", 0)
+            if db.is_market_blacklisted(market_id):
+                continue  # Blacklist: had Lay exit, never re-enter
             if db.is_market_closed_today(market_id):
                 continue  # One-and-Done: already completed full cycle on this market today
             key = (event.get("id", 0), market_id)
@@ -912,6 +919,8 @@ async def _run_phase2(api: MatchbookAPI) -> None:
             if not _passes_liquidity_filter(event, market):
                 continue
             market_id = market.get("id", 0)
+            if db.is_market_blacklisted(market_id):
+                continue  # Blacklist: had Lay exit, never re-enter
             if db.is_market_closed_today(market_id):
                 continue  # One-and-Done: already completed full cycle on this market today
             key = (event.get("id", 0), market_id)
