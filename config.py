@@ -85,8 +85,8 @@ MAX_ODDS = 4.00   # Skip massive underdogs (wide spreads, poor scalping)
 MAX_ODDS_CANCEL = 4.50  # Cancel open orders above this (dead trades)
 
 # Liquidity filter: only trade in high-volume markets
-MIN_EVENT_VOLUME = 50_000   # £50k min event volume (excludes obscure leagues)
-MIN_MARKET_VOLUME = 50_000  # £50k min market volume
+MIN_EVENT_VOLUME = 20_000   # £20k min event volume (excludes obscure leagues)
+MIN_MARKET_VOLUME = 20_000  # £20k min market volume
 LOW_VOLUME_CANCEL_THRESHOLD = 1_000  # Cancel open orders in markets below this
 # Optional: category IDs for top-tier (Premier League, etc.). Empty = volume only.
 ALLOWED_CATEGORY_IDS: list[int] = []
