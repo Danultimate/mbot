@@ -205,25 +205,21 @@ async def _hedge_with_retry(
                     profit,
                 )
                 if not db.get_paper_trading():
-                    db.insert_trade(
+                    # Rule 2 (Source of Truth): do NOT log complete on execution. Poll API first.
+                    pos = db.get_position_by_offer_id(back_offer_id) if back_offer_id else None
+                    db.insert_pending_hedge_confirmation(
+                        hedge_offer_id=result[0].get("id"),
                         market_id=market_id,
                         runner_id=runner_id,
+                        side="lay",
+                        stake=lay_stake,
+                        odds=lay_odds,
                         market_name=market_name,
                         runner_name=runner_name,
-                        side="lay",
-                        odds=lay_odds,
-                        stake=lay_stake,
-                        status=result[0].get("status", "open"),
-                        offer_id=result[0].get("id"),
-                        phase=1,
-                        profit_loss=profit,
+                        event_id=event_id or 0,
+                        position_id=pos["id"] if pos else None,
+                        back_offer_id=back_offer_id,
                     )
-                    pos = db.get_position_by_offer_id(back_offer_id) if back_offer_id else None
-                    if pos:
-                        db.update_position(pos["id"], "closed", profit)
-                    db.record_hedge_cooldown(market_id, runner_id)
-                    db.insert_closed_market(market_id, event_id or 0)
-                    db.insert_blacklisted_market(market_id, event_id or 0)  # Lay exit: never re-enter
                 return True, profit
         except MarketSuspendedError:
             logger.warning(
@@ -321,25 +317,21 @@ async def _hedge_lay_with_retry(
                     profit,
                 )
                 if not db.get_paper_trading():
-                    db.insert_trade(
+                    # Rule 2 (Source of Truth): do NOT log complete on execution. Poll API first.
+                    pos = db.get_position_by_offer_id(lay_offer_id) if lay_offer_id else None
+                    db.insert_pending_hedge_confirmation(
+                        hedge_offer_id=result[0].get("id"),
                         market_id=market_id,
                         runner_id=runner_id,
+                        side="back",
+                        stake=back_stake,
+                        odds=back_odds,
                         market_name=market_name,
                         runner_name=runner_name,
-                        side="back",
-                        odds=back_odds,
-                        stake=back_stake,
-                        status=result[0].get("status", "open"),
-                        offer_id=result[0].get("id"),
-                        phase=1,
-                        profit_loss=profit,
+                        event_id=event_id or 0,
+                        position_id=pos["id"] if pos else None,
+                        back_offer_id=lay_offer_id,
                     )
-                    pos = db.get_position_by_offer_id(lay_offer_id) if lay_offer_id else None
-                    if pos:
-                        db.update_position(pos["id"], "closed", profit)
-                    db.record_hedge_cooldown(market_id, runner_id)
-                    db.insert_closed_market(market_id, event_id or 0)
-                    db.insert_blacklisted_market(market_id, event_id or 0)  # Lay exit: never re-enter
                 return True, profit
         except MarketSuspendedError:
             logger.warning(
@@ -672,9 +664,12 @@ async def _run_phase1(api: MatchbookAPI) -> None:
             )
         return
 
-    # Fetch current offers to avoid re-entering selections we already have exposure on
+    # Rule 1 (Unmatched State Check): before ANY Phase 1 entry, check for existing orders.
+    # Must include BOTH matched AND unmatched/pending. Skip if selection already has an order.
     exposed_runners: set[tuple[int, int]] = set()
-    if not db.get_paper_trading():
+    if db.get_paper_trading():
+        exposed_runners = db.get_paper_exposed_runners()
+    else:
         try:
             offers = await api.get_offers(statuses=["open", "matched"])
             for o in offers:
@@ -702,6 +697,18 @@ async def _run_phase1(api: MatchbookAPI) -> None:
 
         try:
             if db.get_paper_trading():
+                db.insert_paper_order(
+                    market_id=market_id,
+                    runner_id=runner_id,
+                    event_id=event.get("id"),
+                    event_name=event.get("name", ""),
+                    market_name=market.get("name", ""),
+                    runner_name=runner.get("name", ""),
+                    side="back",
+                    odds=back_odds,
+                    stake=stake,
+                    phase=1,
+                )
                 db.insert_paper_trade(
                     event_name=event.get("name", ""),
                     market_name=market.get("name", ""),
@@ -712,6 +719,7 @@ async def _run_phase1(api: MatchbookAPI) -> None:
                     phase=1,
                     reason="Phase 1: Maker Back (2 ticks above best)",
                 )
+                exposed_runners.add((market_id, runner_id))  # Rule 1: block duplicate this loop
                 db.insert_api_log(
                     "request", "PAPER", "Phase 1 Back", None,
                     request_body=f"Would place: {runner.get('name')} Back @ {back_odds} x £{stake}",
@@ -796,6 +804,62 @@ def _runners_with_open_offers(offers: list[dict], side: str) -> set[tuple[int, i
     }
 
 
+async def _process_hedge_confirmations(offers: list[dict]) -> None:
+    """
+    Rule 2 (Source of Truth): Only log trade complete when API returns MATCHED or SETTLED.
+    Poll the offers we got - for each pending hedge, if it appears with matched/settled, process it.
+    """
+    if db.get_paper_trading():
+        return
+    offer_by_id = {o.get("id"): o for o in offers if o.get("id") is not None}
+    for pend in db.get_pending_hedge_confirmations():
+        oid = pend["hedge_offer_id"]
+        o = offer_by_id.get(oid)
+        if not o or o.get("status", "").lower() not in ("matched", "settled"):
+            continue
+        market_id = pend["market_id"]
+        runner_id = pend["runner_id"]
+        side = pend["side"]
+        stake = pend["stake"]
+        odds = pend["odds"]
+        pos = db.get_position_by_id(pend["position_id"]) if pend["position_id"] else None
+        if pos:
+            entry_stake = pos["entry_stake"]
+            entry_odds = pos["entry_odds"]
+            if side == "lay":
+                profit = _locked_in_profit_back_hedge(entry_stake, entry_odds, odds)
+            else:
+                profit = _locked_in_profit_lay_hedge(entry_stake, entry_odds, odds)
+        else:
+            profit = 0.0
+        db.insert_trade(
+            market_id=market_id,
+            runner_id=runner_id,
+            market_name=pend.get("market_name", ""),
+            runner_name=pend.get("runner_name", ""),
+            side=side,
+            odds=odds,
+            stake=stake,
+            status=o.get("status", "matched"),
+            offer_id=oid,
+            phase=1,
+            profit_loss=profit,
+        )
+        if pos:
+            db.update_position(pos["id"], "closed", profit)
+        db.record_hedge_cooldown(market_id, runner_id)
+        db.insert_closed_market(market_id, pend.get("event_id") or 0)
+        db.insert_blacklisted_market(market_id, pend.get("event_id") or 0)
+        db.delete_pending_hedge_confirmation(pend["id"])
+        logger.info(
+            "Hedge confirmed (API matched/settled): %s %s @ %.2f, profit £%.2f",
+            pend.get("runner_name", ""),
+            side,
+            odds,
+            profit,
+        )
+
+
 async def hedge_all_matched_positions(
     api: MatchbookAPI, hedge_all: bool = False
 ) -> None:
@@ -803,8 +867,13 @@ async def hedge_all_matched_positions(
     Fetch matched offers and hedge each (Back with Lay, Lay with Back).
     Exit state check: never place a hedge if an open hedge order already exists.
     hedge_all=True: process all matched (panic hedge). False: one per call (bot cycle).
+    Rule 2: Process pending hedge confirmations (API source of truth) before placing new hedges.
     """
-    offers = await api.get_offers(statuses=["open", "matched"])
+    if not db.get_paper_trading():
+        offers = await api.get_offers(statuses=["open", "matched"])
+        await _process_hedge_confirmations(offers)
+    else:
+        offers = []
     open_lay_runners = _runners_with_open_offers(offers, "lay")
     open_back_runners = _runners_with_open_offers(offers, "back")
     count = 0
@@ -845,6 +914,79 @@ async def hedge_all_matched_positions(
             break  # One per bot cycle
     if hedge_all and count > 0:
         logger.info("Panic hedge: closed %d matched position(s)", count)
+
+
+async def _process_paper_simulated_fills(api: MatchbookAPI) -> None:
+    """
+    Rule 3 (Simulated Fill): Paper mode only. For each open paper order, check market price.
+    If price crosses our odds, mark MATCHED and log theoretical profit. Do not poll order status.
+    """
+    if not db.get_paper_trading():
+        return
+    orders = db.get_open_paper_orders()
+    if not orders:
+        return
+    market_ids = list({o["market_id"] for o in orders})
+    events = await api.get_events(
+        sport_ids=_get_sport_ids(),
+        include_prices=True,
+        price_depth=1,
+        states="open",
+        per_page=100,
+    )
+    # Build runner_id -> (best_back, best_lay) for each market
+    runner_prices: dict[tuple[int, int], tuple[Optional[float], Optional[float]]] = {}
+    for ev in events:
+        for mkt in ev.get("markets", []):
+            if mkt.get("id") not in market_ids:
+                continue
+            mid = mkt["id"]
+            for runner in mkt.get("runners", []):
+                rid = runner.get("id")
+                if rid is not None:
+                    best_back, best_lay = _get_best_back_lay(runner.get("prices", []))
+                    runner_prices[(mid, rid)] = (best_back, best_lay)
+    for order in orders:
+        key = (order["market_id"], order["runner_id"])
+        prices = runner_prices.get(key)
+        if not prices or (prices[0] is None and prices[1] is None):
+            continue
+        best_back, best_lay = prices
+        odds = order["odds"]
+        stake = order["stake"]
+        side = (order["side"] or "").lower()
+        filled = False
+        profit = 0.0
+        if side == "back":
+            if best_lay is not None and best_lay <= odds:
+                filled = True
+                if best_lay > 0:
+                    profit = _locked_in_profit_back_hedge(stake, odds, best_lay)
+        elif side == "lay":
+            if best_back is not None and best_back >= odds:
+                filled = True
+                if best_back > 0:
+                    profit = _locked_in_profit_lay_hedge(stake, odds, best_back)
+        if filled:
+            db.update_paper_order_matched(order["id"])
+            db.insert_paper_trade_with_profit(
+                event_name=order.get("event_name", ""),
+                market_name=order.get("market_name", ""),
+                runner_name=order.get("runner_name", ""),
+                side=side,
+                odds=odds,
+                stake=stake,
+                phase=order.get("phase", 1),
+                reason="Simulated fill: price crossed",
+                profit_loss=profit,
+            )
+            logger.info(
+                "PAPER: Simulated fill %s @ %.2f for %s, theoretical profit £%.2f",
+                side,
+                odds,
+                order.get("runner_name", ""),
+                profit,
+            )
 
 
 async def _fetch_lay_odds(api: MatchbookAPI, runner_id: int) -> Optional[float]:
@@ -961,9 +1103,11 @@ async def _run_phase2(api: MatchbookAPI) -> None:
         best = max(runners, key=lambda r: (r[6], -r[3]))  # max spread, then min back_odds
         phase2_candidates.append(best)
 
-    # Fetch current offers for pre-entry check
+    # Rule 1: Check for existing orders (matched + unmatched) before Phase 2 entry
     exposed_runners: set[tuple[int, int]] = set()
-    if not db.get_paper_trading():
+    if db.get_paper_trading():
+        exposed_runners = db.get_paper_exposed_runners()
+    else:
         try:
             offers = await api.get_offers(statuses=["open", "matched"])
             for o in offers:
@@ -980,6 +1124,30 @@ async def _run_phase2(api: MatchbookAPI) -> None:
             continue
         try:
             if db.get_paper_trading():
+                db.insert_paper_order(
+                    market_id=market_id,
+                    runner_id=runner_id,
+                    event_id=event.get("id"),
+                    event_name=event.get("name", ""),
+                    market_name=market.get("name", ""),
+                    runner_name=runner.get("name", ""),
+                    side="back",
+                    odds=back_odds,
+                    stake=stake,
+                    phase=2,
+                )
+                db.insert_paper_order(
+                    market_id=market_id,
+                    runner_id=runner_id,
+                    event_id=event.get("id"),
+                    event_name=event.get("name", ""),
+                    market_name=market.get("name", ""),
+                    runner_name=runner.get("name", ""),
+                    side="lay",
+                    odds=lay_odds,
+                    stake=stake,
+                    phase=2,
+                )
                 db.insert_paper_trade(
                     event_name=event.get("name", ""),
                     market_name=market.get("name", ""),
@@ -1084,6 +1252,9 @@ async def _main_loop() -> None:
 
         phase = 2 if free_funds >= config.PHASE2_MIN_BANKROLL else 1
         logger.info("Bankroll: £%.2f, Phase: %d", free_funds, phase)
+
+        # Rule 3: Paper mode - simulate fills before new entries
+        await _process_paper_simulated_fills(api)
 
         if phase == 1:
             await _run_phase1(api)

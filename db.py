@@ -131,8 +131,49 @@ def init_db() -> None:
                 PRIMARY KEY (market_id)
             );
             CREATE INDEX IF NOT EXISTS idx_blacklisted_markets_market_id ON blacklisted_markets(market_id);
+
+            CREATE TABLE IF NOT EXISTS paper_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_id INTEGER NOT NULL,
+                runner_id INTEGER NOT NULL,
+                event_id INTEGER,
+                event_name TEXT,
+                market_name TEXT,
+                runner_name TEXT,
+                side TEXT NOT NULL,
+                odds REAL NOT NULL,
+                stake REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                phase INTEGER,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_paper_orders_status ON paper_orders(status);
+            CREATE INDEX IF NOT EXISTS idx_paper_orders_market_runner ON paper_orders(market_id, runner_id);
+
+            CREATE TABLE IF NOT EXISTS pending_hedge_confirmations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                hedge_offer_id INTEGER NOT NULL,
+                market_id INTEGER NOT NULL,
+                runner_id INTEGER NOT NULL,
+                side TEXT NOT NULL,
+                stake REAL NOT NULL,
+                odds REAL NOT NULL,
+                market_name TEXT,
+                runner_name TEXT,
+                event_id INTEGER,
+                position_id INTEGER,
+                back_offer_id INTEGER,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_hedge_offer_id ON pending_hedge_confirmations(hedge_offer_id);
         """)
         conn.commit()
+        # Migration: add profit_loss to paper_trades (simulated fill logging)
+        try:
+            conn.execute("ALTER TABLE paper_trades ADD COLUMN profit_loss REAL")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
     finally:
         conn.close()
 
@@ -296,6 +337,20 @@ def get_position_by_offer_id(offer_id: int) -> Optional[dict]:
         conn.close()
 
 
+def get_position_by_id(position_id: int) -> Optional[dict]:
+    """Return position dict for given id, or None."""
+    conn = get_connection()
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT id, market_id, runner_id, market_name, runner_name, side, entry_odds, entry_stake, offer_id FROM positions WHERE id = ?",
+            (position_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
 def get_open_positions() -> list[dict]:
     """Return list of open positions as dicts."""
     conn = get_connection()
@@ -416,6 +471,194 @@ def is_market_blacklisted(market_id: int) -> bool:
             (market_id,),
         ).fetchone()
         return row is not None
+    finally:
+        conn.close()
+
+
+# --- Paper orders (Rule 1: unmatched check, Rule 3: simulated fill) ---
+
+
+def get_paper_exposed_runners() -> set[tuple[int, int]]:
+    """Return (market_id, runner_id) for all paper orders with status open OR matched."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT market_id, runner_id FROM paper_orders WHERE status IN ('open', 'matched')"
+        ).fetchall()
+        return {(int(r[0]), int(r[1])) for r in rows}
+    finally:
+        conn.close()
+
+
+def insert_paper_order(
+    market_id: int,
+    runner_id: int,
+    event_id: Optional[int],
+    event_name: str,
+    market_name: str,
+    runner_name: str,
+    side: str,
+    odds: float,
+    stake: float,
+    phase: int,
+) -> int:
+    """Insert paper order as UNMATCHED. Returns row id."""
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            """INSERT INTO paper_orders (market_id, runner_id, event_id, event_name, market_name,
+               runner_name, side, odds, stake, status, phase, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
+            (
+                market_id,
+                runner_id,
+                event_id or 0,
+                event_name or "",
+                market_name or "",
+                runner_name or "",
+                side,
+                odds,
+                stake,
+                phase,
+                datetime.utcnow().isoformat(),
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def get_open_paper_orders() -> list[dict]:
+    """Return all paper orders with status open (for simulated fill check)."""
+    conn = get_connection()
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, market_id, runner_id, event_id, side, odds, stake, event_name, market_name, runner_name, phase "
+            "FROM paper_orders WHERE status = 'open'"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def update_paper_order_matched(order_id: int) -> None:
+    """Mark paper order as matched (simulated fill)."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE paper_orders SET status = 'matched' WHERE id = ?",
+            (order_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def insert_paper_trade_with_profit(
+    event_name: str,
+    market_name: str,
+    runner_name: str,
+    side: str,
+    odds: float,
+    stake: float,
+    phase: int,
+    reason: str,
+    profit_loss: Optional[float] = None,
+) -> int:
+    """Insert paper trade with optional profit_loss (simulated fill)."""
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            """INSERT INTO paper_trades (timestamp, event_name, market_name, runner_name,
+               side, odds, stake, phase, reason, profit_loss)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                datetime.utcnow().isoformat(),
+                event_name or "",
+                market_name or "",
+                runner_name or "",
+                side,
+                odds,
+                stake,
+                phase,
+                reason or "",
+                profit_loss,
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+# --- Pending hedge confirmations (Rule 2: Live source of truth) ---
+
+
+def insert_pending_hedge_confirmation(
+    hedge_offer_id: int,
+    market_id: int,
+    runner_id: int,
+    side: str,
+    stake: float,
+    odds: float,
+    market_name: str,
+    runner_name: str,
+    event_id: int,
+    position_id: Optional[int],
+    back_offer_id: Optional[int],
+) -> int:
+    """Record hedge order placed; will confirm via API poll before logging complete."""
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            """INSERT INTO pending_hedge_confirmations
+               (hedge_offer_id, market_id, runner_id, side, stake, odds, market_name,
+                runner_name, event_id, position_id, back_offer_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                hedge_offer_id,
+                market_id,
+                runner_id,
+                side,
+                stake,
+                odds,
+                market_name or "",
+                runner_name or "",
+                event_id,
+                position_id,
+                back_offer_id,
+                datetime.utcnow().isoformat(),
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def get_pending_hedge_confirmations() -> list[dict]:
+    """Return all pending hedge confirmations (for API poll)."""
+    conn = get_connection()
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT id, hedge_offer_id, market_id, runner_id, side, stake, odds,
+                      market_name, runner_name, event_id, position_id, back_offer_id
+               FROM pending_hedge_confirmations"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def delete_pending_hedge_confirmation(pending_id: int) -> None:
+    """Remove pending confirmation after processing."""
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM pending_hedge_confirmations WHERE id = ?", (pending_id,))
+        conn.commit()
     finally:
         conn.close()
 
@@ -674,22 +917,23 @@ def insert_paper_trade(
 
 
 def clear_paper_trades() -> None:
-    """Clear all paper trades (for testing)."""
+    """Clear all paper trades and paper orders (for testing)."""
     conn = get_connection()
     try:
         conn.execute("DELETE FROM paper_trades")
+        conn.execute("DELETE FROM paper_orders")
         conn.commit()
     finally:
         conn.close()
 
 
 def get_paper_trades(limit: int = 50) -> list[dict]:
-    """Return recent paper trades for display."""
+    """Return recent paper trades for display. Includes profit_loss for simulated fills."""
     conn = get_connection()
     try:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            """SELECT timestamp, event_name, market_name, runner_name, side, odds, stake, phase, reason
+            """SELECT timestamp, event_name, market_name, runner_name, side, odds, stake, phase, reason, profit_loss
                FROM paper_trades ORDER BY timestamp DESC LIMIT ?""",
             (limit,),
         ).fetchall()

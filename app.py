@@ -526,6 +526,7 @@ def main():
                     "Stake": t.get("stake"),
                     "Phase": t.get("phase"),
                     "Logic": t.get("reason", ""),
+                    "Profit": f"£{t.get('profit_loss'):.2f}" if t.get("profit_loss") is not None else "",
                 }
                 for t in paper_trades
             ]
