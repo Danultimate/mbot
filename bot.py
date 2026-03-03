@@ -222,6 +222,9 @@ async def _hedge_with_retry(
                         back_offer_id=back_offer_id,
                         event_name=event_name,
                     )
+                    db.insert_blacklisted_market(market_id, event_id or 0)  # Parent/Child: mark CLOSED immediately
+                    if pos:
+                        db.update_position_to_hedge_pending(pos["id"])  # Link Child to Parent
                 return True, profit
         except MarketSuspendedError:
             logger.warning(
@@ -336,6 +339,9 @@ async def _hedge_lay_with_retry(
                         back_offer_id=lay_offer_id,
                         event_name=event_name,
                     )
+                    db.insert_blacklisted_market(market_id, event_id or 0)  # Parent/Child: mark CLOSED immediately
+                    if pos:
+                        db.update_position_to_hedge_pending(pos["id"])  # Link Child to Parent
                 return True, profit
         except MarketSuspendedError:
             logger.warning(
@@ -479,6 +485,7 @@ async def _close_events_before_start(api: MatchbookAPI) -> bool:
     if not events_to_close:
         return False
 
+    child_offer_ids = {p["hedge_offer_id"] for p in db.get_pending_hedge_confirmations()}
     order_placed = False
     for event_id in events_to_close:
         event_offers = [o for o in offers if o.get("event-id") == event_id]
@@ -496,16 +503,20 @@ async def _close_events_before_start(api: MatchbookAPI) -> bool:
             except Exception as e:
                 logger.exception("Failed to cancel offers: %s", e)
 
-        # Hedge matched positions (Back with Lay, Lay with Back)
+        # Hedge matched positions (Back with Lay, Lay with Back) - skip Child offers & blacklisted markets
         for o in event_offers:
             if o.get("status") != "matched":
                 continue
+            if o.get("id") in child_offer_ids:
+                continue  # Global Ignore: this is our Child hedge
+            market_id = int(o.get("market-id") or 0)
+            if db.is_market_blacklisted(market_id):
+                continue  # Global Ignore: market CLOSED/HEDGED
             runner_id = o.get("runner-id")
             stake = float(o.get("stake", 0) or o.get("remaining", 0))
             odds = float(o.get("odds", 0) or o.get("decimal-odds", 0))
             if stake <= 0 or odds <= 0 or not runner_id:
                 continue
-            market_id = o.get("market-id") or 0
             if o.get("side") == "back":
                 if not db.get_paper_trading():
                     ok, _ = await _hedge_with_retry(
@@ -897,18 +908,27 @@ async def hedge_all_matched_positions(
         await _process_hedge_confirmations(offers)
     else:
         offers = []
+
+    # Global Ignore Rule: never hedge Child orders or markets marked CLOSED/HEDGED
+    pending = db.get_pending_hedge_confirmations()
+    child_offer_ids = {p["hedge_offer_id"] for p in pending}
+
     open_lay_runners = _runners_with_open_offers(offers, "lay")
     open_back_runners = _runners_with_open_offers(offers, "back")
     count = 0
     for offer in offers:
         if offer.get("status") != "matched":
             continue
+        if offer.get("id") in child_offer_ids:
+            continue  # Ignore: this is our Child hedge order
+        market_id = int(offer.get("market-id") or 0)
+        if db.is_market_blacklisted(market_id):
+            continue  # Ignore: market marked CLOSED/HEDGED
         runner_id = offer.get("runner-id")
         stake = float(offer.get("stake", 0) or offer.get("remaining", 0))
         odds = float(offer.get("odds", 0) or offer.get("decimal-odds", 0))
         if stake <= 0 or odds <= 0 or not runner_id:
             continue
-        market_id = offer.get("market-id") or 0
         key = (int(market_id or 0), int(runner_id or 0))
         market_name = offer.get("market-name", "")
         runner_name = offer.get("runner-name", "")

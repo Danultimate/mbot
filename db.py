@@ -289,6 +289,19 @@ def update_position(
         conn.close()
 
 
+def update_position_to_hedge_pending(position_id: int) -> None:
+    """Mark position as hedge_pending (Child hedge placed; do not hedge again)."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE positions SET status = 'hedge_pending' WHERE id = ?",
+            (position_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def insert_bankroll_snapshot(
     balance: float,
     exposure: float,
