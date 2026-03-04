@@ -57,8 +57,10 @@ MARKET_TYPES = ["one_x_two", "money_line", "over_under_25"]
 
 # Tick size for decimal odds (e.g. 2.0 -> 2.02 -> 2.04)
 TICK_SIZE = 0.02
-# Entry: Back orders placed as maker (1-2 ticks above best Back)
-BACK_TICKS_ABOVE = 2
+# Entry: Lay-first strategy - Lay at 2 ticks below best Lay
+LAY_TICKS_BELOW = 2
+# Lay-first stop-loss: hedge (Back) if market drops this many ticks below matched Lay odds
+LAY_STOP_LOSS_TICKS = 2
 # Exit hedge: Lay placed at best_lay - N ticks (maker). Time Stop overrides.
 HEDGE_LAY_TICKS_BELOW = 1
 # Exit hedge: Back placed at best_back - N ticks (maker). Time Stop overrides.

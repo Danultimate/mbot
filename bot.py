@@ -49,7 +49,7 @@ def _green_up_lay_stake(back_stake: float, back_odds: float, lay_odds: float) ->
 
 def _green_up_back_stake(lay_stake: float, lay_odds: float, back_odds: float) -> float:
     """
-    Compute the Back stake required to Green Up a Lay position.
+    Compute the Back stake required to Green Up a Lay position (Lay-First exit).
     Formula: Back Stake = (Lay Stake * Lay Odds) / Back Odds
     """
     if back_odds <= 0:
@@ -531,13 +531,14 @@ async def _close_events_before_start(api: MatchbookAPI) -> bool:
                         order_placed = True
             elif o.get("side") == "lay":
                 if not db.get_paper_trading():
+                    # Time Stop: always emergency close (event starting soon)
                     ok, _ = await _hedge_lay_with_retry(
                         api, runner_id, stake, odds,
                         o.get("market-name", ""), o.get("runner-name", ""),
                         market_id=market_id, event_id=event_id,
                         event_name=o.get("event-name", ""),
                         lay_offer_id=o.get("id"),
-                        emergency_close=True,  # Time Stop: cross spread for immediate exit
+                        emergency_close=True,
                     )
                     if ok:
                         order_placed = True
@@ -547,9 +548,9 @@ async def _close_events_before_start(api: MatchbookAPI) -> bool:
 
 async def _run_phase1(api: MatchbookAPI) -> bool:
     """
-    Phase 1: Directional Scalping ("Buy the Dip").
-    Bankroll £25–£200. Only place Back orders at a discount (2 ticks above best).
-    On match: immediately Green Up with Lay order.
+    Phase 1: Lay-First Strategy ("Lay the Rise").
+    Bankroll £25–£200. Place Maker Lay orders 2 ticks below best Lay.
+    On match: hedge with Maker Back order (Phase 2).
     """
     logger.info("Running Phase 1 (Scalping)")
     sport_ids = _get_sport_ids()
@@ -612,19 +613,19 @@ async def _run_phase1(api: MatchbookAPI) -> bool:
                 best_back, best_lay = _get_best_back_lay(prices)
                 if best_back is None or best_lay is None:
                     continue
-                if best_back < config.MIN_ODDS or best_back > config.MAX_ODDS:
-                    continue  # Odds filter: sweet spot 1.50–4.00 only
+                if best_lay is None or best_lay < config.MIN_ODDS or best_lay > config.MAX_ODDS:
+                    continue  # Odds filter: sweet spot 1.50–4.00 (use best_lay for Lay entry)
                 spread = (best_lay or 0) - (best_back or 0)
                 if key not in market_candidates:
                     market_candidates[key] = []
                 market_candidates[key].append((event, market, runner, best_back, best_lay, spread))
 
-    # One runner per market: pick widest spread (best scalping edge). Tiebreaker: lower odds (liquidity).
+    # One runner per market: pick widest spread. Tiebreaker: min best_lay (liquidity for Lay).
     candidates = []
     for key, runners in market_candidates.items():
         if not runners:
             continue
-        best = max(runners, key=lambda r: (r[5], -r[3]))  # max spread, then min best_back
+        best = max(runners, key=lambda r: (r[5], -r[4]))  # max spread, then min best_lay
         candidates.append((best[0], best[1], best[2], best[3], best[4]))
 
     account = api.get_account()
@@ -707,7 +708,7 @@ async def _run_phase1(api: MatchbookAPI) -> bool:
 
     db.insert_api_log(
         "response", "BOT", "Phase 1", None,
-        request_body=f"Found {len(candidates)} candidates. Placing up to 5 Back orders (stake £{round(min(free_funds * 0.1, 5.0), 2)})",
+        request_body=f"Found {len(candidates)} candidates. Placing up to 5 Lay orders (stake £{round(min(free_funds * 0.1, 5.0), 2)})",
     )
 
     order_placed = False
@@ -717,10 +718,17 @@ async def _run_phase1(api: MatchbookAPI) -> bool:
         if not _can_enter_selection(market_id, runner_id, exposed_runners):
             continue
 
-        # Maker: Back at least 1-2 ticks above best Back (provide liquidity, wait for market)
-        ticks_above = max(1, config.BACK_TICKS_ABOVE)
-        back_odds = _round_odds(best_back + config.TICK_SIZE * ticks_above)
-        stake = round(max_stake, 2)
+        # Maker: Lay at exactly 2 ticks below best Lay (Lay-First strategy)
+        ticks_below = max(1, config.LAY_TICKS_BELOW)
+        lay_odds = _round_odds(best_lay - config.TICK_SIZE * ticks_below)
+        if lay_odds < 1.02:
+            continue  # Avoid invalid odds
+        base_stake = round(min(max_stake, free_funds * 0.1), 2)
+        # Lay liability cap: stake * (lay_odds - 1) <= free_funds
+        max_by_liability = free_funds / (lay_odds - 1) if lay_odds > 1.0 else base_stake
+        stake = round(min(base_stake, max_by_liability), 2)
+        if stake < 2.0:
+            continue
 
         try:
             if db.get_paper_trading():
@@ -731,8 +739,8 @@ async def _run_phase1(api: MatchbookAPI) -> bool:
                     event_name=event.get("name", ""),
                     market_name=market.get("name", ""),
                     runner_name=runner.get("name", ""),
-                    side="back",
-                    odds=back_odds,
+                    side="lay",
+                    odds=lay_odds,
                     stake=stake,
                     phase=1,
                 )
@@ -740,33 +748,33 @@ async def _run_phase1(api: MatchbookAPI) -> bool:
                     event_name=event.get("name", ""),
                     market_name=market.get("name", ""),
                     runner_name=runner.get("name", ""),
-                    side="back",
-                    odds=back_odds,
+                    side="lay",
+                    odds=lay_odds,
                     stake=stake,
                     phase=1,
-                    reason="Phase 1: Maker Back (2 ticks above best)",
+                    reason="Phase 1: Maker Lay (2 ticks below best)",
                 )
                 exposed_runners.add((market_id, runner_id))  # Rule 1: block duplicate this loop
                 db.insert_api_log(
-                    "request", "PAPER", "Phase 1 Back", None,
-                    request_body=f"Would place: {runner.get('name')} Back @ {back_odds} x £{stake}",
+                    "request", "PAPER", "Phase 1 Lay", None,
+                    request_body=f"Would place: {runner.get('name')} Lay @ {lay_odds} x £{stake}",
                 )
                 logger.info(
-                    "PAPER: Phase 1 Back would place: %s @ %.2f x %.2f",
+                    "PAPER: Phase 1 Lay would place: %s @ %.2f x %.2f",
                     runner.get("name"),
-                    back_odds,
+                    lay_odds,
                     stake,
                 )
             else:
                 db.insert_api_log(
                     "request", "LIVE", "Phase 1 submit_offers", None,
-                    request_body=f"Placing Back: {runner.get('name')} @ {back_odds} x £{stake}",
+                    request_body=f"Placing Lay: {runner.get('name')} @ {lay_odds} x £{stake}",
                 )
                 offers = [
                     {
                         "runner-id": runner["id"],
-                        "side": "back",
-                        "odds": back_odds,
+                        "side": "lay",
+                        "odds": lay_odds,
                         "stake": stake,
                         "keep-in-play": False,
                     }
@@ -779,22 +787,22 @@ async def _run_phase1(api: MatchbookAPI) -> bool:
                         runner_id=runner["id"],
                         market_name=market.get("name", ""),
                         runner_name=runner.get("name", ""),
-                        side="back",
-                        odds=back_odds,
+                        side="lay",
+                        odds=lay_odds,
                         stake=stake,
                         status=offer.get("status", "open"),
                         offer_id=offer.get("id"),
                         phase=1,
                         event_name=event.get("name", ""),
-                        reason="Phase 1: Maker Back (2 ticks above best)",
+                        reason="Phase 1: Maker Lay (2 ticks below best)",
                     )
                     db.insert_position(
                         market_id=market.get("id"),
                         runner_id=runner["id"],
                         market_name=market.get("name", ""),
                         runner_name=runner.get("name", ""),
-                        side="back",
-                        entry_odds=back_odds,
+                        side="lay",
+                        entry_odds=lay_odds,
                         entry_stake=stake,
                         offer_id=offer.get("id"),
                     )
@@ -804,9 +812,9 @@ async def _run_phase1(api: MatchbookAPI) -> bool:
                         response_body=f"Order placed: status={offer.get('status')} offer_id={offer.get('id')}",
                     )
                     logger.info(
-                        "Phase 1 Back placed: %s @ %.2f x %.2f",
+                        "Phase 1 Lay placed: %s @ %.2f x %.2f",
                         runner.get("name"),
-                        back_odds,
+                        lay_odds,
                         stake,
                     )
                     order_placed = True
@@ -950,12 +958,24 @@ async def hedge_all_matched_positions(
             if key in open_back_runners:
                 continue  # Exit state check: Back hedge already pending, don't stack
             if not db.get_paper_trading():
+                # Lay-first stop-loss: if price dropped N ticks below our Lay odds, emergency exit
+                emergency = False
+                current_lay = await _fetch_lay_odds(api, runner_id)
+                if current_lay is not None and odds > 0:
+                    threshold = odds - config.TICK_SIZE * config.LAY_STOP_LOSS_TICKS
+                    if current_lay < threshold:
+                        emergency = True
+                        logger.info(
+                            "Lay stop-loss: %s current Lay %.2f < %.2f (matched %.2f - %d ticks), emergency hedge",
+                            runner_name, current_lay, threshold, odds, config.LAY_STOP_LOSS_TICKS,
+                        )
                 ok, _ = await _hedge_lay_with_retry(
                     api, runner_id, stake, odds,
                     market_name, runner_name,
                     market_id=market_id, event_id=event_id,
                     event_name=offer.get("event-name", ""),
                     lay_offer_id=offer.get("id"),
+                    emergency_close=emergency,
                 )
                 if ok:
                     hedge_placed = True
