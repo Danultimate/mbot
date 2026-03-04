@@ -57,6 +57,15 @@ def _green_up_back_stake(lay_stake: float, lay_odds: float, back_odds: float) ->
     return round((lay_stake * lay_odds) / back_odds, 2)
 
 
+def _net_green_up_profit(lay_stake: float, back_stake: float) -> float:
+    """
+    Net profit for perfectly hedged trade.
+    Formula: Net Profit = Matched Lay Stake - Matched Back Stake.
+    Works for both Back-then-Lay and Lay-then-Back cycles.
+    """
+    return round(float(lay_stake) - float(back_stake), 2)
+
+
 def _locked_in_profit_back_hedge(
     back_stake: float, back_odds: float, lay_odds: float
 ) -> float:
@@ -222,9 +231,7 @@ async def _hedge_with_retry(
                         back_offer_id=back_offer_id,
                         event_name=event_name,
                     )
-                    db.insert_blacklisted_market(market_id, event_id or 0)  # Parent/Child: mark CLOSED immediately
-                    if pos:
-                        db.update_position_to_hedge_pending(pos["id"])  # Link Child to Parent
+                    # Hard Lock: hedge_pending + blacklist set by caller BEFORE this call
                 return True, profit
         except MarketSuspendedError:
             logger.warning(
@@ -339,9 +346,7 @@ async def _hedge_lay_with_retry(
                         back_offer_id=lay_offer_id,
                         event_name=event_name,
                     )
-                    db.insert_blacklisted_market(market_id, event_id or 0)  # Parent/Child: mark CLOSED immediately
-                    if pos:
-                        db.update_position_to_hedge_pending(pos["id"])  # Link Child to Parent
+                    # Hard Lock: hedge_pending + blacklist set by caller BEFORE this call
                 return True, profit
         except MarketSuspendedError:
             logger.warning(
@@ -485,7 +490,10 @@ async def _close_events_before_start(api: MatchbookAPI) -> bool:
     if not events_to_close:
         return False
 
-    child_offer_ids = {p["hedge_offer_id"] for p in db.get_pending_hedge_confirmations()}
+    pending = db.get_pending_hedge_confirmations()
+    child_offer_ids = {p["hedge_offer_id"] for p in pending}
+    parent_ids_already_hedged = db.get_hedge_initiated_parent_ids()
+    parent_ids_already_hedged.update(p["back_offer_id"] for p in pending if p.get("back_offer_id"))
     order_placed = False
     for event_id in events_to_close:
         event_offers = [o for o in offers if o.get("event-id") == event_id]
@@ -503,15 +511,21 @@ async def _close_events_before_start(api: MatchbookAPI) -> bool:
             except Exception as e:
                 logger.exception("Failed to cancel offers: %s", e)
 
-        # Hedge matched positions (Back with Lay, Lay with Back) - skip Child offers & blacklisted markets
+        # Hedge matched positions - Hard Lock: Execution Block + mark BEFORE API call
         for o in event_offers:
             if o.get("status") != "matched":
                 continue
-            if o.get("id") in child_offer_ids:
-                continue  # Global Ignore: this is our Child hedge
+            parent_id = o.get("id")
+            if parent_id in child_offer_ids:
+                continue
+            if parent_id in parent_ids_already_hedged:
+                continue
+            pos = db.get_position_by_offer_id(parent_id)
+            if pos and pos.get("status") == "hedge_pending":
+                continue
             market_id = int(o.get("market-id") or 0)
             if db.is_market_blacklisted(market_id):
-                continue  # Global Ignore: market CLOSED/HEDGED
+                continue
             runner_id = o.get("runner-id")
             stake = float(o.get("stake", 0) or o.get("remaining", 0))
             odds = float(o.get("odds", 0) or o.get("decimal-odds", 0))
@@ -519,6 +533,10 @@ async def _close_events_before_start(api: MatchbookAPI) -> bool:
                 continue
             if o.get("side") == "back":
                 if not db.get_paper_trading():
+                    db.insert_hedge_initiated(parent_id)
+                    if pos:
+                        db.update_position_to_hedge_pending(pos["id"])
+                    db.insert_blacklisted_market(market_id, event_id)
                     ok, _ = await _hedge_with_retry(
                         api, runner_id, stake, odds,
                         o.get("market-name", ""), o.get("runner-name", ""),
@@ -531,7 +549,10 @@ async def _close_events_before_start(api: MatchbookAPI) -> bool:
                         order_placed = True
             elif o.get("side") == "lay":
                 if not db.get_paper_trading():
-                    # Time Stop: always emergency close (event starting soon)
+                    db.insert_hedge_initiated(parent_id)
+                    if pos:
+                        db.update_position_to_hedge_pending(pos["id"])
+                    db.insert_blacklisted_market(market_id, event_id)
                     ok, _ = await _hedge_lay_with_retry(
                         api, runner_id, stake, odds,
                         o.get("market-name", ""), o.get("runner-name", ""),
@@ -861,16 +882,18 @@ async def _process_hedge_confirmations(offers: list[dict]) -> None:
         side = pend["side"]
         stake = pend["stake"]
         odds = pend["odds"]
+        hedge_stake = float(o.get("stake", 0) or o.get("remaining", 0) or stake)
         pos = db.get_position_by_id(pend["position_id"]) if pend["position_id"] else None
+        parent_offer = offer_by_id.get(pend.get("back_offer_id") or 0) if pend.get("back_offer_id") else None
+        parent_stake = float(
+            parent_offer.get("stake", 0) or parent_offer.get("remaining", 0)
+            if parent_offer else 0
+        )
         if pos:
-            entry_stake = pos["entry_stake"]
-            entry_odds = pos["entry_odds"]
-            if side == "lay":
-                profit = _locked_in_profit_back_hedge(entry_stake, entry_odds, odds)
-            else:
-                profit = _locked_in_profit_lay_hedge(entry_stake, entry_odds, odds)
-        else:
-            profit = 0.0
+            parent_stake = parent_stake or float(pos.get("entry_stake") or 0)
+        lay_stake = hedge_stake if side == "lay" else parent_stake
+        back_stake = parent_stake if side == "lay" else hedge_stake
+        profit = _net_green_up_profit(lay_stake, back_stake)
         db.insert_trade(
             market_id=market_id,
             runner_id=runner_id,
@@ -917,18 +940,30 @@ async def hedge_all_matched_positions(
     else:
         offers = []
 
-    # Global Ignore Rule: never hedge Child orders or markets marked CLOSED/HEDGED
+    # Hard Lock: use ONLY local state. Never use exchange Matched/Unmatched/Partially Matched.
     pending = db.get_pending_hedge_confirmations()
     child_offer_ids = {p["hedge_offer_id"] for p in pending}
+    parent_ids_already_hedged = db.get_hedge_initiated_parent_ids()
+    parent_ids_already_hedged.update(p["back_offer_id"] for p in pending if p.get("back_offer_id"))
 
     open_lay_runners = _runners_with_open_offers(offers, "lay")
     open_back_runners = _runners_with_open_offers(offers, "back")
     count = 0
     for offer in offers:
+        # Ignore partial fills: never use exchange status to decide. Only process fully "matched".
         if offer.get("status") != "matched":
             continue
-        if offer.get("id") in child_offer_ids:
-            continue  # Ignore: this is our Child hedge order
+        parent_offer_id = offer.get("id")
+        if parent_offer_id is None:
+            continue
+        # Execution Block: use ONLY local state. If Parent already hedge_pending or initiated, PASS.
+        if parent_offer_id in parent_ids_already_hedged:
+            continue  # Hard Lock: already placed hedge for this Parent
+        if parent_offer_id in child_offer_ids:
+            continue  # Ignore: this is our Child (never hedge the hedge)
+        pos = db.get_position_by_offer_id(parent_offer_id)
+        if pos and pos.get("status") == "hedge_pending":
+            continue  # Hard Lock: Parent marked hedge_pending locally
         market_id = int(offer.get("market-id") or 0)
         if db.is_market_blacklisted(market_id):
             continue  # Ignore: market marked CLOSED/HEDGED
@@ -945,6 +980,11 @@ async def hedge_all_matched_positions(
             if key in open_lay_runners:
                 continue  # Exit state check: Lay hedge already pending, don't stack
             if not db.get_paper_trading():
+                # Hard Lock: mark Parent hedge_pending BEFORE any API call
+                db.insert_hedge_initiated(parent_offer_id)
+                if pos:
+                    db.update_position_to_hedge_pending(pos["id"])
+                db.insert_blacklisted_market(market_id, event_id)
                 ok, _ = await _hedge_with_retry(
                     api, runner_id, stake, odds,
                     market_name, runner_name,
@@ -958,6 +998,11 @@ async def hedge_all_matched_positions(
             if key in open_back_runners:
                 continue  # Exit state check: Back hedge already pending, don't stack
             if not db.get_paper_trading():
+                # Hard Lock: mark Parent hedge_pending BEFORE any API call
+                db.insert_hedge_initiated(parent_offer_id)
+                if pos:
+                    db.update_position_to_hedge_pending(pos["id"])
+                db.insert_blacklisted_market(market_id, event_id)
                 # Lay-first stop-loss: if price dropped N ticks below our Lay odds, emergency exit
                 emergency = False
                 current_lay = await _fetch_lay_odds(api, runner_id)

@@ -166,6 +166,10 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_pending_hedge_offer_id ON pending_hedge_confirmations(hedge_offer_id);
+
+            CREATE TABLE IF NOT EXISTS hedge_initiated (
+                parent_offer_id INTEGER PRIMARY KEY
+            );
         """)
         conn.commit()
         # Migration: add profit_loss to paper_trades (simulated fill logging)
@@ -354,12 +358,12 @@ def get_current_bankroll() -> Optional[tuple[float, float, float]]:
 
 
 def get_position_by_offer_id(offer_id: int) -> Optional[dict]:
-    """Return position dict for given offer_id, or None."""
+    """Return position dict for given offer_id, or None. Includes status for Execution Block."""
     conn = get_connection()
     try:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT id, market_id, runner_id, market_name, runner_name, side, entry_odds, entry_stake, offer_id FROM positions WHERE offer_id = ?",
+            "SELECT id, market_id, runner_id, market_name, runner_name, side, entry_odds, entry_stake, offer_id, status FROM positions WHERE offer_id = ?",
             (offer_id,),
         ).fetchone()
         return dict(row) if row else None
@@ -368,15 +372,38 @@ def get_position_by_offer_id(offer_id: int) -> Optional[dict]:
 
 
 def get_position_by_id(position_id: int) -> Optional[dict]:
-    """Return position dict for given id, or None."""
+    """Return position dict for given id, or None. Includes status for Execution Block."""
     conn = get_connection()
     try:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT id, market_id, runner_id, market_name, runner_name, side, entry_odds, entry_stake, offer_id FROM positions WHERE id = ?",
+            "SELECT id, market_id, runner_id, market_name, runner_name, side, entry_odds, entry_stake, offer_id, status FROM positions WHERE id = ?",
             (position_id,),
         ).fetchone()
         return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def insert_hedge_initiated(parent_offer_id: int) -> None:
+    """Hard Lock: record that we have initiated a Phase 2 hedge for this Parent. One Parent = ONE hedge, ever."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO hedge_initiated (parent_offer_id) VALUES (?)",
+            (parent_offer_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_hedge_initiated_parent_ids() -> set[int]:
+    """Return set of parent_offer_ids we have already initiated a hedge for."""
+    conn = get_connection()
+    try:
+        rows = conn.execute("SELECT parent_offer_id FROM hedge_initiated").fetchall()
+        return {int(r[0]) for r in rows if r[0] is not None}
     finally:
         conn.close()
 

@@ -51,7 +51,7 @@ DAILY_STOP_LOSS_PCT = 10.0
 
 # Market focus: configurable for Football, Political, or both
 # Sport IDs: 1 = American Football (NOT Soccer). Use API Debug → Fetch sports for full list.
-SPORT_IDS = [1]  # Fallback; override in dashboard from Fetch sports
+SPORT_IDS = [15]  # Fallback; override in dashboard from Fetch sports
 # Match Odds (one_x_two / money_line), O/U 2.5 Goals
 MARKET_TYPES = ["one_x_two", "money_line", "over_under_25"]
 
