@@ -170,6 +170,26 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS hedge_initiated (
                 parent_offer_id INTEGER PRIMARY KEY
             );
+
+            CREATE TABLE IF NOT EXISTS phase2_leg_pairs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                back_offer_id INTEGER NOT NULL,
+                lay_offer_id INTEGER NOT NULL,
+                market_id INTEGER NOT NULL,
+                runner_id INTEGER NOT NULL,
+                event_id INTEGER,
+                market_name TEXT,
+                runner_name TEXT,
+                event_name TEXT,
+                stake REAL NOT NULL,
+                back_odds REAL NOT NULL,
+                lay_odds REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                leg_timer_started_at TEXT,
+                matched_leg_side TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_phase2_leg_pairs_status ON phase2_leg_pairs(status);
         """)
         conn.commit()
         # Migration: add profit_loss to paper_trades (simulated fill logging)
@@ -404,6 +424,140 @@ def get_hedge_initiated_parent_ids() -> set[int]:
     try:
         rows = conn.execute("SELECT parent_offer_id FROM hedge_initiated").fetchall()
         return {int(r[0]) for r in rows if r[0] is not None}
+    finally:
+        conn.close()
+
+
+# --- Phase 2 Leg Timer (adverse selection protection) ---
+
+
+def insert_phase2_leg_pair(
+    back_offer_id: int,
+    lay_offer_id: int,
+    market_id: int,
+    runner_id: int,
+    event_id: int,
+    stake: float,
+    back_odds: float,
+    lay_odds: float,
+    market_name: str = "",
+    runner_name: str = "",
+    event_name: str = "",
+) -> int:
+    """Record a Phase 2 Back+Lay pair for leg monitoring."""
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            """INSERT INTO phase2_leg_pairs
+               (back_offer_id, lay_offer_id, market_id, runner_id, event_id, stake,
+                back_odds, lay_odds, market_name, runner_name, event_name, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
+            (
+                back_offer_id,
+                lay_offer_id,
+                market_id,
+                runner_id,
+                event_id,
+                stake,
+                back_odds,
+                lay_odds,
+                market_name or "",
+                runner_name or "",
+                event_name or "",
+                datetime.utcnow().isoformat(),
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def get_active_phase2_leg_pairs() -> list[dict]:
+    """Return all active Phase 2 leg pairs for monitoring."""
+    conn = get_connection()
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT id, back_offer_id, lay_offer_id, market_id, runner_id, event_id,
+                      market_name, runner_name, event_name, stake, back_odds, lay_odds,
+                      status, leg_timer_started_at, matched_leg_side
+               FROM phase2_leg_pairs WHERE status = 'active'"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def update_phase2_leg_timer(pair_id: int, matched_leg_side: str) -> None:
+    """Start the leg timer when first leg matches."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            """UPDATE phase2_leg_pairs SET leg_timer_started_at = ?, matched_leg_side = ?
+               WHERE id = ? AND status = 'active' AND leg_timer_started_at IS NULL""",
+            (datetime.utcnow().isoformat(), matched_leg_side, pair_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_phase2_leg_pair_complete(pair_id: int, status: str = "complete") -> None:
+    """Mark pair as complete (both matched or bailout done)."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE phase2_leg_pairs SET status = ? WHERE id = ?",
+            (status, pair_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_phase2_offer_ids() -> set[int]:
+    """Return set of all offer IDs in active Phase 2 pairs (for hedge exclusion)."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT back_offer_id, lay_offer_id FROM phase2_leg_pairs WHERE status = 'active'"
+        ).fetchall()
+        ids = set()
+        for r in rows:
+            if r[0] is not None:
+                ids.add(int(r[0]))
+            if r[1] is not None:
+                ids.add(int(r[1]))
+        return ids
+    finally:
+        conn.close()
+
+
+def get_all_tracked_offer_ids() -> set[int]:
+    """Return set of all offer IDs currently tracked in local state (positions, pending hedges, hedge_initiated, phase2 pairs)."""
+    conn = get_connection()
+    try:
+        ids = set()
+        for row in conn.execute("SELECT offer_id FROM positions WHERE offer_id IS NOT NULL"):
+            if row[0] is not None:
+                ids.add(int(row[0]))
+        for row in conn.execute("SELECT hedge_offer_id, back_offer_id FROM pending_hedge_confirmations"):
+            if row[0] is not None:
+                ids.add(int(row[0]))
+            if row[1] is not None:
+                ids.add(int(row[1]))
+        for row in conn.execute("SELECT parent_offer_id FROM hedge_initiated"):
+            if row[0] is not None:
+                ids.add(int(row[0]))
+        for row in conn.execute(
+            "SELECT back_offer_id, lay_offer_id FROM phase2_leg_pairs WHERE status = 'active'"
+        ):
+            if row[0] is not None:
+                ids.add(int(row[0]))
+            if row[1] is not None:
+                ids.add(int(row[1]))
+        return ids
     finally:
         conn.close()
 

@@ -68,6 +68,8 @@ HEDGE_BACK_TICKS_BELOW = 1
 # Phase 2: spread harvesting - Back at best+1 tick, Lay at best-1 tick
 PHASE2_BACK_TICKS_ABOVE = 1
 PHASE2_LAY_TICKS_BELOW = 1
+# Phase 2 Leg Timer: seconds to wait for second leg before bailout (adverse selection protection)
+PHASE2_LEG_TIMEOUT_SEC = 10
 
 # Entry cooldown: seconds after a trade is hedged before re-entering same selection
 ENTRY_COOLDOWN_SEC = 60

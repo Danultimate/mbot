@@ -455,6 +455,148 @@ async def _cancel_low_volume_orders(api: MatchbookAPI) -> None:
             logger.warning("Failed to cancel low-volume orders: %s", e)
 
 
+async def _run_startup_state_recovery(api: MatchbookAPI) -> None:
+    """
+    Startup State Recovery: adopt orphaned exchange orders into local tracking.
+    Run on init before any new trades. Query API for open+matched orders, compare to local state.
+    Orphaned Phase 1 Lays are adopted (position). Orphaned Lay+Back pairs adopted (position + pending_hedge).
+    Orphaned lone Back (naked long) cannot be adopted: fire Taker Lay hedge immediately.
+    If adoption fails (missing data), fire Taker hedge to close exposure.
+    """
+    if db.get_paper_trading():
+        return
+    try:
+        offers = await api.get_offers(statuses=["open", "matched", "settled"])
+    except Exception as e:
+        logger.warning("Startup state recovery: could not fetch offers: %s", e)
+        return
+    if not offers:
+        return
+    tracked = db.get_all_tracked_offer_ids()
+    orphans = [o for o in offers if o.get("id") is not None and int(o.get("id")) not in tracked]
+    if not orphans:
+        return
+    logger.info("Startup state recovery: found %d orphaned order(s) on exchange", len(orphans))
+    by_runner: dict[tuple[int, int], list[dict]] = {}
+    for o in orphans:
+        mid = o.get("market-id")
+        rid = o.get("runner-id")
+        if mid is not None and rid is not None:
+            key = (int(mid), int(rid))
+            by_runner.setdefault(key, []).append(o)
+    for key, runner_offers in by_runner.items():
+        market_id, runner_id = key
+        backs = [o for o in runner_offers if (o.get("side") or "").lower() == "back"]
+        lays = [o for o in runner_offers if (o.get("side") or "").lower() == "lay"]
+        lay_o = lays[0] if lays else None
+        back_o = backs[0] if backs else None
+
+        def _valid(o: dict) -> bool:
+            s = float(o.get("stake", 0) or o.get("remaining", 0) or 0)
+            od = float(o.get("odds", 0) or o.get("decimal-odds", 0) or 0)
+            return s > 0 and od > 0
+
+        if lay_o and back_o:
+            if not _valid(lay_o) or not _valid(back_o):
+                logger.warning("Recovery: orphan Lay+Back for %s/%s has invalid stake/odds, firing taker hedge for Lay", market_id, runner_id)
+                stake = float(lay_o.get("stake", 0) or lay_o.get("remaining", 0) or 0)
+                odds = float(lay_o.get("odds", 0) or lay_o.get("decimal-odds", 0) or 0)
+                if stake > 0 and odds > 0:
+                    db.insert_hedge_initiated(lay_o.get("id"))
+                    ok, _ = await _hedge_lay_with_retry(
+                        api, runner_id, stake, odds,
+                        lay_o.get("market-name", ""), lay_o.get("runner-name", ""),
+                        market_id=market_id, event_id=lay_o.get("event-id") or 0,
+                        event_name=lay_o.get("event-name", ""), lay_offer_id=lay_o.get("id"),
+                        emergency_close=True,
+                    )
+                    if ok:
+                        logger.info("Recovery: taker Back hedge placed for Lay %s", lay_o.get("runner-name", ""))
+                continue
+            pos = db.insert_position(
+                market_id=market_id,
+                runner_id=runner_id,
+                market_name=lay_o.get("market-name", ""),
+                runner_name=lay_o.get("runner-name", ""),
+                side="lay",
+                entry_odds=float(lay_o.get("odds", 0) or lay_o.get("decimal-odds", 0)),
+                entry_stake=float(lay_o.get("stake", 0) or lay_o.get("remaining", 0)),
+                offer_id=lay_o.get("id"),
+            )
+            db.insert_hedge_initiated(lay_o.get("id"))
+            stake_b = float(back_o.get("stake", 0) or back_o.get("remaining", 0))
+            odds_b = float(back_o.get("odds", 0) or back_o.get("decimal-odds", 0))
+            db.insert_pending_hedge_confirmation(
+                hedge_offer_id=back_o.get("id"),
+                market_id=market_id,
+                runner_id=runner_id,
+                side="back",
+                stake=stake_b,
+                odds=odds_b,
+                market_name=back_o.get("market-name", ""),
+                runner_name=back_o.get("runner-name", ""),
+                event_id=back_o.get("event-id") or 0,
+                position_id=pos,
+                back_offer_id=lay_o.get("id"),
+                event_name=back_o.get("event-name", ""),
+            )
+            db.update_position_to_hedge_pending(pos)
+            db.insert_blacklisted_market(market_id, lay_o.get("event-id") or 0)
+            logger.info("Recovery: adopted Lay+Back for %s (market %s)", lay_o.get("runner-name", ""), market_id)
+            await asyncio.sleep(config.RATE_LIMIT_DELAY_MS / 1000.0)
+            continue
+
+        if lay_o:
+            if not _valid(lay_o):
+                logger.warning("Recovery: orphan Lay for %s/%s has invalid stake/odds, firing taker hedge", market_id, runner_id)
+                stake = float(lay_o.get("stake", 0) or lay_o.get("remaining", 0) or 0)
+                odds = float(lay_o.get("odds", 0) or lay_o.get("decimal-odds", 0) or 0)
+                if stake > 0 and odds > 0:
+                    db.insert_hedge_initiated(lay_o.get("id"))
+                    ok, _ = await _hedge_lay_with_retry(
+                        api, runner_id, stake, odds,
+                        lay_o.get("market-name", ""), lay_o.get("runner-name", ""),
+                        market_id=market_id, event_id=lay_o.get("event-id") or 0,
+                        event_name=lay_o.get("event-name", ""), lay_offer_id=lay_o.get("id"),
+                        emergency_close=True,
+                    )
+                    if ok:
+                        logger.info("Recovery: taker Back hedge placed for orphan Lay %s", lay_o.get("runner-name", ""))
+                continue
+            db.insert_position(
+                market_id=market_id,
+                runner_id=runner_id,
+                market_name=lay_o.get("market-name", ""),
+                runner_name=lay_o.get("runner-name", ""),
+                side="lay",
+                entry_odds=float(lay_o.get("odds", 0) or lay_o.get("decimal-odds", 0)),
+                entry_stake=float(lay_o.get("stake", 0) or lay_o.get("remaining", 0)),
+                offer_id=lay_o.get("id"),
+            )
+            logger.info("Recovery: adopted orphan Lay for %s (market %s) - Stop-Loss will manage", lay_o.get("runner-name", ""), market_id)
+            await asyncio.sleep(config.RATE_LIMIT_DELAY_MS / 1000.0)
+            continue
+
+        if back_o:
+            logger.warning("Recovery: lone orphan Back (naked long) for %s - firing taker Lay hedge", back_o.get("runner-name", ""))
+            stake = float(back_o.get("stake", 0) or back_o.get("remaining", 0) or 0)
+            odds = float(back_o.get("odds", 0) or back_o.get("decimal-odds", 0) or 0)
+            if stake <= 0 or odds <= 0:
+                logger.error("Recovery: cannot hedge lone Back - invalid stake/odds")
+                continue
+            db.insert_hedge_initiated(back_o.get("id"))
+            ok, _ = await _hedge_with_retry(
+                api, runner_id, stake, odds,
+                back_o.get("market-name", ""), back_o.get("runner-name", ""),
+                market_id=market_id, event_id=back_o.get("event-id") or 0,
+                event_name=back_o.get("event-name", ""), back_offer_id=back_o.get("id"),
+                emergency_close=True,
+            )
+            if ok:
+                logger.info("Recovery: taker Lay hedge placed for lone Back %s", back_o.get("runner-name", ""))
+            await asyncio.sleep(config.RATE_LIMIT_DELAY_MS / 1000.0)
+
+
 async def _close_events_before_start(api: MatchbookAPI) -> bool:
     """
     When pre-match only: cancel open orders and hedge matched positions
@@ -924,6 +1066,115 @@ async def _process_hedge_confirmations(offers: list[dict]) -> None:
         )
 
 
+async def _process_phase2_leg_monitoring(api: MatchbookAPI) -> None:
+    """
+    Phase 2 Leg Timer and Bailout: protect against adverse selection (legging risk).
+    If ONE leg of a Phase 2 Back+Lay pair is matched, start a timer. If the second leg
+    is NOT matched within LEG_TIMEOUT_SEC, cancel the unmatched leg and fire a Market
+    (Taker) order at best price to close the naked position.
+    """
+    if db.get_paper_trading():
+        return
+    pairs = db.get_active_phase2_leg_pairs()
+    if not pairs:
+        return
+    offer_ids = []
+    for p in pairs:
+        bid, lid = p.get("back_offer_id"), p.get("lay_offer_id")
+        if bid is not None:
+            offer_ids.append(int(bid))
+        if lid is not None:
+            offer_ids.append(int(lid))
+    offer_ids = list(set(offer_ids))
+    try:
+        offers = await api.get_offers(offer_ids=offer_ids, statuses=["open", "matched", "settled"])
+    except Exception as e:
+        logger.warning("Phase 2 leg monitoring: could not fetch offers: %s", e)
+        return
+    offer_by_id = {o.get("id"): o for o in offers if o.get("id") is not None}
+    now = datetime.now(timezone.utc)
+    timeout_sec = config.PHASE2_LEG_TIMEOUT_SEC
+
+    for pair in pairs:
+        back_o = offer_by_id.get(pair["back_offer_id"])
+        lay_o = offer_by_id.get(pair["lay_offer_id"])
+        back_matched = back_o and (back_o.get("status", "").lower() in ("matched", "settled"))
+        lay_matched = lay_o and (lay_o.get("status", "").lower() in ("matched", "settled"))
+
+        if back_matched and lay_matched:
+            db.insert_hedge_initiated(pair["back_offer_id"])
+            db.insert_hedge_initiated(pair["lay_offer_id"])
+            db.mark_phase2_leg_pair_complete(pair["id"], "both_matched")
+            logger.info("Phase 2 both legs matched: %s (market %s)", pair.get("runner_name", ""), pair.get("market_id"))
+            continue
+
+        if back_matched and not lay_matched:
+            if not pair.get("leg_timer_started_at"):
+                db.update_phase2_leg_timer(pair["id"], "back")
+                logger.info("Phase 2 leg timer started: Back matched for %s, waiting %ds for Lay", pair.get("runner_name", ""), timeout_sec)
+            else:
+                try:
+                    started = datetime.fromisoformat(str(pair["leg_timer_started_at"]).replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    started = now
+                elapsed = (now - started).total_seconds()
+                if elapsed >= timeout_sec:
+                    logger.warning("Phase 2 leg bailout: Back matched, Lay unmatched after %.0fs. Cancelling Lay, placing taker hedge.", elapsed)
+                    try:
+                        await api.cancel_offers(offer_ids=[pair["lay_offer_id"]])
+                    except Exception as e:
+                        logger.warning("Failed to cancel Phase 2 Lay: %s", e)
+                    db.insert_hedge_initiated(pair["back_offer_id"])
+                    stake = float(back_o.get("stake", 0) or back_o.get("remaining", 0) or pair["stake"])
+                    odds = float(back_o.get("odds", 0) or back_o.get("decimal-odds", 0) or pair["back_odds"])
+                    ok, _ = await _hedge_with_retry(
+                        api, pair["runner_id"], stake, odds,
+                        pair.get("market_name", ""), pair.get("runner_name", ""),
+                        market_id=pair["market_id"], event_id=pair.get("event_id", 0),
+                        event_name=pair.get("event_name", ""),
+                        back_offer_id=pair["back_offer_id"],
+                        emergency_close=True,
+                    )
+                    db.mark_phase2_leg_pair_complete(pair["id"], "bailout_back_matched")
+                    if ok:
+                        logger.info("Phase 2 bailout: taker Lay hedge placed for %s", pair.get("runner_name", ""))
+                    await asyncio.sleep(config.RATE_LIMIT_DELAY_MS / 1000.0)
+            continue
+
+        if lay_matched and not back_matched:
+            if not pair.get("leg_timer_started_at"):
+                db.update_phase2_leg_timer(pair["id"], "lay")
+                logger.info("Phase 2 leg timer started: Lay matched for %s, waiting %ds for Back", pair.get("runner_name", ""), timeout_sec)
+            else:
+                try:
+                    started = datetime.fromisoformat(str(pair["leg_timer_started_at"]).replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    started = now
+                elapsed = (now - started).total_seconds()
+                if elapsed >= timeout_sec:
+                    logger.warning("Phase 2 leg bailout: Lay matched, Back unmatched after %.0fs. Cancelling Back, placing taker hedge.", elapsed)
+                    try:
+                        await api.cancel_offers(offer_ids=[pair["back_offer_id"]])
+                    except Exception as e:
+                        logger.warning("Failed to cancel Phase 2 Back: %s", e)
+                    db.insert_hedge_initiated(pair["lay_offer_id"])
+                    stake = float(lay_o.get("stake", 0) or lay_o.get("remaining", 0) or pair["stake"])
+                    odds = float(lay_o.get("odds", 0) or lay_o.get("decimal-odds", 0) or pair["lay_odds"])
+                    ok, _ = await _hedge_lay_with_retry(
+                        api, pair["runner_id"], stake, odds,
+                        pair.get("market_name", ""), pair.get("runner_name", ""),
+                        market_id=pair["market_id"], event_id=pair.get("event_id", 0),
+                        event_name=pair.get("event_name", ""),
+                        lay_offer_id=pair["lay_offer_id"],
+                        emergency_close=True,
+                    )
+                    db.mark_phase2_leg_pair_complete(pair["id"], "bailout_lay_matched")
+                    if ok:
+                        logger.info("Phase 2 bailout: taker Back hedge placed for %s", pair.get("runner_name", ""))
+                    await asyncio.sleep(config.RATE_LIMIT_DELAY_MS / 1000.0)
+            continue
+
+
 async def hedge_all_matched_positions(
     api: MatchbookAPI, hedge_all: bool = False
 ) -> bool:
@@ -932,11 +1183,13 @@ async def hedge_all_matched_positions(
     Exit state check: never place a hedge if an open hedge order already exists.
     hedge_all=True: process all matched (panic hedge). False: one per call (bot cycle).
     Rule 2: Process pending hedge confirmations (API source of truth) before placing new hedges.
+    Phase 2 offers are excluded: handled by _process_phase2_leg_monitoring.
     """
     hedge_placed = False
     if not db.get_paper_trading():
         offers = await api.get_offers(statuses=["open", "matched"])
         await _process_hedge_confirmations(offers)
+        await _process_phase2_leg_monitoring(api)
     else:
         offers = []
 
@@ -945,6 +1198,7 @@ async def hedge_all_matched_positions(
     child_offer_ids = {p["hedge_offer_id"] for p in pending}
     parent_ids_already_hedged = db.get_hedge_initiated_parent_ids()
     parent_ids_already_hedged.update(p["back_offer_id"] for p in pending if p.get("back_offer_id"))
+    parent_ids_already_hedged.update(db.get_phase2_offer_ids())  # Exclude Phase 2 legs
 
     open_lay_runners = _runners_with_open_offers(offers, "lay")
     open_back_runners = _runners_with_open_offers(offers, "back")
@@ -1305,6 +1559,24 @@ async def _run_phase2(api: MatchbookAPI) -> bool:
                 result = await api.submit_offers(offers)
                 if result:
                     db.insert_blacklisted_market(market_id, event.get("id", 0))  # Rule 3: instant blacklist on Phase 2 Lay
+                    back_offer = result[0] if len(result) > 0 else {}
+                    lay_offer = result[1] if len(result) > 1 else {}
+                    back_offer_id = back_offer.get("id")
+                    lay_offer_id = lay_offer.get("id")
+                    if back_offer_id and lay_offer_id:
+                        db.insert_phase2_leg_pair(
+                            back_offer_id=back_offer_id,
+                            lay_offer_id=lay_offer_id,
+                            market_id=market_id,
+                            runner_id=runner_id,
+                            event_id=event.get("id", 0),
+                            stake=stake,
+                            back_odds=back_odds,
+                            lay_odds=lay_odds,
+                            market_name=market.get("name", ""),
+                            runner_name=runner.get("name", ""),
+                            event_name=event.get("name", ""),
+                        )
                     db.insert_api_log("response", "LIVE", "Phase 2 submit_offers", 200, response_body=f"Orders placed: {len(result)} offers")
                     logger.info("Phase 2 orders placed: %s Back %.2f Lay %.2f @ %.2f", runner.get("name"), back_odds, lay_odds, stake)
                     await asyncio.sleep(config.RATE_LIMIT_DELAY_MS / 1000.0)
@@ -1336,6 +1608,9 @@ async def _main_loop() -> None:
 
         daily_roi = db.get_daily_roi_pct()
         db.insert_bankroll_snapshot(balance, exposure, free_funds, daily_roi)
+
+        # Startup State Recovery: adopt orphaned exchange orders before any new trades (runs even when paused)
+        await _run_startup_state_recovery(api)
 
         if not trading_enabled:
             logger.info("Bot is paused. Snapshot recorded, no orders placed.")
