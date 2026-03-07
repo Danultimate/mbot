@@ -166,11 +166,11 @@ async def _hedge_with_retry(
     event_id: Optional[int] = None,
     event_name: str = "",
     back_offer_id: Optional[int] = None,
-    emergency_close: bool = False,
+    emergency_close: bool = True,
 ) -> tuple[bool, Optional[float]]:
     """
-    Place Green Up Lay order, retrying on Market Suspended every 2 seconds.
-    Maker by default: Lay at best_lay - ticks (unmatched). Time Stop uses emergency_close=True to cross.
+    Place Green Up Lay order (TAKER: cross spread for instant fill), retrying on Market Suspended.
+    Always uses best available Lay odds to guarantee 100% fill and prevent execution risk.
     Returns (success, locked_in_profit).
     """
     for attempt in range(config.MAX_HEDGE_RETRIES):
@@ -180,16 +180,7 @@ async def _hedge_with_retry(
                 logger.warning("No valid lay odds for hedge, retrying...")
                 await asyncio.sleep(config.HEDGE_RETRY_INTERVAL_SEC)
                 continue
-
-            # Maker: place at best_lay - ticks (or lower). Emergency: place at best_lay (take).
-            if emergency_close:
-                lay_odds = best_lay
-            else:
-                ticks_below = max(1, config.HEDGE_LAY_TICKS_BELOW)
-                lay_odds = _round_odds(best_lay - config.TICK_SIZE * ticks_below)
-                if lay_odds < 1.02:  # Avoid invalid odds on short prices
-                    lay_odds = best_lay
-
+            lay_odds = best_lay
             lay_stake = _green_up_lay_stake(back_stake, back_odds, lay_odds)
             if lay_stake <= 0:
                 logger.warning("Invalid green up stake")
@@ -281,11 +272,11 @@ async def _hedge_lay_with_retry(
     event_id: Optional[int] = None,
     event_name: str = "",
     lay_offer_id: Optional[int] = None,
-    emergency_close: bool = False,
+    emergency_close: bool = True,
 ) -> tuple[bool, Optional[float]]:
     """
-    Place Green Up Back order to close a Lay position.
-    Maker by default: Back at best_back - ticks (unmatched). Time Stop uses emergency_close=True to cross.
+    Place Green Up Back order (TAKER: cross spread for instant fill) to close a Lay position.
+    Always uses best available Back odds to guarantee 100% fill and prevent execution risk.
     Returns (success, locked_in_profit).
     """
     for attempt in range(config.MAX_HEDGE_RETRIES):
@@ -295,16 +286,7 @@ async def _hedge_lay_with_retry(
                 logger.warning("No valid back odds for Lay hedge, retrying...")
                 await asyncio.sleep(config.HEDGE_RETRY_INTERVAL_SEC)
                 continue
-
-            # Maker: place at best_back - ticks (or lower). Emergency: place at best_back (take).
-            if emergency_close:
-                back_odds = best_back
-            else:
-                ticks_below = max(1, config.HEDGE_BACK_TICKS_BELOW)
-                back_odds = _round_odds(best_back - config.TICK_SIZE * ticks_below)
-                if back_odds < 1.02:  # Avoid invalid odds on short prices
-                    back_odds = best_back
-
+            back_odds = best_back
             back_stake = _green_up_back_stake(lay_stake, lay_odds, back_odds)
             if back_stake <= 0:
                 logger.warning("Invalid green up back stake")
@@ -673,8 +655,11 @@ async def _close_events_before_start(api: MatchbookAPI) -> bool:
             odds = float(o.get("odds", 0) or o.get("decimal-odds", 0))
             if stake <= 0 or odds <= 0 or not runner_id:
                 continue
+            if db.is_selection_hedged(market_id, runner_id):
+                continue  # Hard Lock: selection already hedged, never double exit
             if o.get("side") == "back":
                 if not db.get_paper_trading():
+                    db.insert_hedged_selection(market_id, runner_id)
                     db.insert_hedge_initiated(parent_id)
                     if pos:
                         db.update_position_to_hedge_pending(pos["id"])
@@ -691,6 +676,7 @@ async def _close_events_before_start(api: MatchbookAPI) -> bool:
                         order_placed = True
             elif o.get("side") == "lay":
                 if not db.get_paper_trading():
+                    db.insert_hedged_selection(market_id, runner_id)
                     db.insert_hedge_initiated(parent_id)
                     if pos:
                         db.update_position_to_hedge_pending(pos["id"])
@@ -1036,14 +1022,17 @@ async def _process_hedge_confirmations(offers: list[dict]) -> None:
         lay_stake = hedge_stake if side == "lay" else parent_stake
         back_stake = parent_stake if side == "lay" else hedge_stake
         profit = _net_green_up_profit(lay_stake, back_stake)
+        # Use API-confirmed matched stake and odds (not requested) for CSV accuracy
+        matched_stake = float(o.get("stake", 0) or o.get("remaining", 0) or hedge_stake)
+        matched_odds = float(o.get("odds", 0) or o.get("decimal-odds", 0) or odds)
         db.insert_trade(
             market_id=market_id,
             runner_id=runner_id,
             market_name=pend.get("market_name", ""),
             runner_name=pend.get("runner_name", ""),
             side=side,
-            odds=odds,
-            stake=stake,
+            odds=matched_odds,
+            stake=matched_stake,
             status=o.get("status", "matched"),
             offer_id=oid,
             phase=1,
@@ -1119,11 +1108,15 @@ async def _process_phase2_leg_monitoring(api: MatchbookAPI) -> None:
                     started = now
                 elapsed = (now - started).total_seconds()
                 if elapsed >= timeout_sec:
+                    if db.is_selection_hedged(pair["market_id"], pair["runner_id"]):
+                        db.mark_phase2_leg_pair_complete(pair["id"], "bailout_back_matched")
+                        continue  # Hard Lock: already hedged by another path
                     logger.warning("Phase 2 leg bailout: Back matched, Lay unmatched after %.0fs. Cancelling Lay, placing taker hedge.", elapsed)
                     try:
                         await api.cancel_offers(offer_ids=[pair["lay_offer_id"]])
                     except Exception as e:
                         logger.warning("Failed to cancel Phase 2 Lay: %s", e)
+                    db.insert_hedged_selection(pair["market_id"], pair["runner_id"])
                     db.insert_hedge_initiated(pair["back_offer_id"])
                     stake = float(back_o.get("stake", 0) or back_o.get("remaining", 0) or pair["stake"])
                     odds = float(back_o.get("odds", 0) or back_o.get("decimal-odds", 0) or pair["back_odds"])
@@ -1152,11 +1145,15 @@ async def _process_phase2_leg_monitoring(api: MatchbookAPI) -> None:
                     started = now
                 elapsed = (now - started).total_seconds()
                 if elapsed >= timeout_sec:
+                    if db.is_selection_hedged(pair["market_id"], pair["runner_id"]):
+                        db.mark_phase2_leg_pair_complete(pair["id"], "bailout_lay_matched")
+                        continue  # Hard Lock: already hedged by another path
                     logger.warning("Phase 2 leg bailout: Lay matched, Back unmatched after %.0fs. Cancelling Back, placing taker hedge.", elapsed)
                     try:
                         await api.cancel_offers(offer_ids=[pair["back_offer_id"]])
                     except Exception as e:
                         logger.warning("Failed to cancel Phase 2 Back: %s", e)
+                    db.insert_hedged_selection(pair["market_id"], pair["runner_id"])
                     db.insert_hedge_initiated(pair["lay_offer_id"])
                     stake = float(lay_o.get("stake", 0) or lay_o.get("remaining", 0) or pair["stake"])
                     odds = float(lay_o.get("odds", 0) or lay_o.get("decimal-odds", 0) or pair["lay_odds"])
@@ -1219,9 +1216,12 @@ async def hedge_all_matched_positions(
         if pos and pos.get("status") == "hedge_pending":
             continue  # Hard Lock: Parent marked hedge_pending locally
         market_id = int(offer.get("market-id") or 0)
+        runner_id = offer.get("runner-id")
+        # Hard Lock: once ANY hedge fired for this selection, never fire another (prevents double exit)
+        if db.is_selection_hedged(market_id, runner_id):
+            continue
         if db.is_market_blacklisted(market_id):
             continue  # Ignore: market marked CLOSED/HEDGED
-        runner_id = offer.get("runner-id")
         stake = float(offer.get("stake", 0) or offer.get("remaining", 0))
         odds = float(offer.get("odds", 0) or offer.get("decimal-odds", 0))
         if stake <= 0 or odds <= 0 or not runner_id:
@@ -1230,11 +1230,15 @@ async def hedge_all_matched_positions(
         market_name = offer.get("market-name", "")
         runner_name = offer.get("runner-name", "")
         event_id = offer.get("event-id") or 0
+        # Hard Lock: once ANY hedge fired for this selection, never fire another (prevents double exit)
+        if db.is_selection_hedged(market_id, runner_id):
+            continue
         if offer.get("side") == "back":
             if key in open_lay_runners:
                 continue  # Exit state check: Lay hedge already pending, don't stack
             if not db.get_paper_trading():
-                # Hard Lock: mark Parent hedge_pending BEFORE any API call
+                # Hard Lock: selection lock BEFORE any API call (prevents double exit)
+                db.insert_hedged_selection(market_id, runner_id)
                 db.insert_hedge_initiated(parent_offer_id)
                 if pos:
                     db.update_position_to_hedge_pending(pos["id"])
@@ -1252,20 +1256,19 @@ async def hedge_all_matched_positions(
             if key in open_back_runners:
                 continue  # Exit state check: Back hedge already pending, don't stack
             if not db.get_paper_trading():
-                # Hard Lock: mark Parent hedge_pending BEFORE any API call
+                # Hard Lock: selection lock BEFORE any API call (prevents double exit)
+                db.insert_hedged_selection(market_id, runner_id)
                 db.insert_hedge_initiated(parent_offer_id)
                 if pos:
                     db.update_position_to_hedge_pending(pos["id"])
                 db.insert_blacklisted_market(market_id, event_id)
-                # Lay-first stop-loss: if price dropped N ticks below our Lay odds, emergency exit
-                emergency = False
+                # Lay-first stop-loss: if price dropped N ticks below our Lay odds, log and exit (always taker)
                 current_lay = await _fetch_lay_odds(api, runner_id)
                 if current_lay is not None and odds > 0:
                     threshold = odds - config.TICK_SIZE * config.LAY_STOP_LOSS_TICKS
                     if current_lay < threshold:
-                        emergency = True
                         logger.info(
-                            "Lay stop-loss: %s current Lay %.2f < %.2f (matched %.2f - %d ticks), emergency hedge",
+                            "Lay stop-loss: %s current Lay %.2f < %.2f (matched %.2f - %d ticks), taker hedge",
                             runner_name, current_lay, threshold, odds, config.LAY_STOP_LOSS_TICKS,
                         )
                 ok, _ = await _hedge_lay_with_retry(
@@ -1274,7 +1277,6 @@ async def hedge_all_matched_positions(
                     market_id=market_id, event_id=event_id,
                     event_name=offer.get("event-name", ""),
                     lay_offer_id=offer.get("id"),
-                    emergency_close=emergency,
                 )
                 if ok:
                     hedge_placed = True

@@ -171,6 +171,13 @@ def init_db() -> None:
                 parent_offer_id INTEGER PRIMARY KEY
             );
 
+            CREATE TABLE IF NOT EXISTS hedged_selections (
+                market_id INTEGER NOT NULL,
+                runner_id INTEGER NOT NULL,
+                hedged_at TEXT NOT NULL,
+                PRIMARY KEY (market_id, runner_id)
+            );
+
             CREATE TABLE IF NOT EXISTS phase2_leg_pairs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 back_offer_id INTEGER NOT NULL,
@@ -424,6 +431,32 @@ def get_hedge_initiated_parent_ids() -> set[int]:
     try:
         rows = conn.execute("SELECT parent_offer_id FROM hedge_initiated").fetchall()
         return {int(r[0]) for r in rows if r[0] is not None}
+    finally:
+        conn.close()
+
+
+def is_selection_hedged(market_id: int, runner_id: int) -> bool:
+    """True if we have fired ANY hedge for this (market_id, runner_id). Permanent lock - no double exit."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM hedged_selections WHERE market_id = ? AND runner_id = ?",
+            (market_id, runner_id),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def insert_hedged_selection(market_id: int, runner_id: int) -> None:
+    """Lock this selection: we have fired a hedge. No further hedge may be placed for it."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO hedged_selections (market_id, runner_id, hedged_at) VALUES (?, ?, ?)",
+            (market_id, runner_id, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
     finally:
         conn.close()
 
