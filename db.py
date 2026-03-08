@@ -439,9 +439,11 @@ def is_selection_hedged(market_id: int, runner_id: int) -> bool:
     """True if we have fired ANY hedge for this (market_id, runner_id). Permanent lock - no double exit."""
     conn = get_connection()
     try:
+        mid = int(market_id)
+        rid = int(runner_id)
         row = conn.execute(
             "SELECT 1 FROM hedged_selections WHERE market_id = ? AND runner_id = ?",
-            (market_id, runner_id),
+            (mid, rid),
         ).fetchone()
         return row is not None
     finally:
@@ -452,9 +454,11 @@ def insert_hedged_selection(market_id: int, runner_id: int) -> None:
     """Lock this selection: we have fired a hedge. No further hedge may be placed for it."""
     conn = get_connection()
     try:
+        mid = int(market_id)
+        rid = int(runner_id)
         conn.execute(
             "INSERT OR IGNORE INTO hedged_selections (market_id, runner_id, hedged_at) VALUES (?, ?, ?)",
-            (market_id, runner_id, datetime.utcnow().isoformat()),
+            (mid, rid, datetime.utcnow().isoformat()),
         )
         conn.commit()
     finally:
