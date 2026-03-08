@@ -212,6 +212,13 @@ def init_db() -> None:
                 conn.commit()
             except sqlite3.OperationalError:
                 pass
+        # Migration: add expected/slippage audit to trades
+        for col in ("expected_profit", "slippage"):
+            try:
+                conn.execute(f"ALTER TABLE trades ADD COLUMN {col} REAL")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
         # Migration: add event_name to pending_hedge_confirmations
         try:
             conn.execute("ALTER TABLE pending_hedge_confirmations ADD COLUMN event_name TEXT DEFAULT ''")
@@ -234,6 +241,8 @@ def insert_trade(
     offer_id: Optional[int] = None,
     phase: Optional[int] = None,
     profit_loss: Optional[float] = None,
+    expected_profit: Optional[float] = None,
+    slippage: Optional[float] = None,
     event_name: str = "",
     reason: str = "",
 ) -> int:
@@ -242,8 +251,8 @@ def insert_trade(
     try:
         cur = conn.execute(
             """INSERT INTO trades (timestamp, market_id, runner_id, market_name, runner_name,
-               side, odds, stake, status, offer_id, phase, profit_loss, event_name, reason)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               side, odds, stake, status, offer_id, phase, profit_loss, expected_profit, slippage, event_name, reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 datetime.utcnow().isoformat(),
                 market_id,
@@ -257,6 +266,8 @@ def insert_trade(
                 offer_id,
                 phase,
                 profit_loss,
+                expected_profit,
+                slippage,
                 event_name or "",
                 reason or "",
             ),
@@ -919,7 +930,8 @@ def get_trades(limit: int = 100) -> list[dict]:
     try:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            """SELECT timestamp, event_name, market_name, runner_name, side, odds, stake, phase, reason, profit_loss
+            """SELECT timestamp, event_name, market_name, runner_name, side, odds, stake, phase, reason,
+                      profit_loss, expected_profit, slippage
                FROM trades ORDER BY timestamp DESC LIMIT ?""",
             (limit,),
         ).fetchall()

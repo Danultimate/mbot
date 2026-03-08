@@ -22,6 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 hedge_fired_for_selection: set[tuple[int, int]] = set()
+hedge_in_flight_for_selection: set[tuple[int, int]] = set()
 
 
 def _selection_key(market_id: int, runner_id: int) -> Optional[tuple[int, int]]:
@@ -41,6 +42,8 @@ def _is_hedge_fired_for_selection(market_id: int, runner_id: int) -> bool:
     key = _selection_key(market_id, runner_id)
     if not key:
         return False
+    if key in hedge_in_flight_for_selection:
+        return True
     if key in hedge_fired_for_selection:
         return True
     locked = db.is_selection_hedged(key[0], key[1])
@@ -55,7 +58,22 @@ def _lock_hedge_fired_for_selection(market_id: int, runner_id: int) -> None:
     if not key:
         return
     hedge_fired_for_selection.add(key)
+    hedge_in_flight_for_selection.discard(key)
     db.insert_hedged_selection(key[0], key[1])
+
+
+def _mark_hedge_in_flight(market_id: int, runner_id: int) -> None:
+    """Set temporary lock right before submit_offers call."""
+    key = _selection_key(market_id, runner_id)
+    if key:
+        hedge_in_flight_for_selection.add(key)
+
+
+def _clear_hedge_in_flight(market_id: int, runner_id: int) -> None:
+    """Clear temporary lock when submit fails or returns no accepted order."""
+    key = _selection_key(market_id, runner_id)
+    if key:
+        hedge_in_flight_for_selection.discard(key)
 
 
 def _log_hedge_lock_skip(reason: str, market_id: int, runner_id: int) -> None:
@@ -261,12 +279,13 @@ async def _hedge_with_retry(
     """
     for attempt in range(config.MAX_HEDGE_RETRIES):
         try:
-            best_lay = await _fetch_lay_odds(api, runner_id)
-            if best_lay is None or best_lay <= 0:
+            # TAKER Lay must hit current best Back price to fill instantly.
+            best_back = await _fetch_back_odds(api, runner_id, market_id=market_id)
+            if best_back is None or best_back <= 0:
                 logger.warning("No valid lay odds for hedge, retrying...")
                 await asyncio.sleep(config.HEDGE_RETRY_INTERVAL_SEC)
                 continue
-            lay_odds = best_lay
+            lay_odds = best_back
             lay_stake = _green_up_lay_stake(back_stake, back_odds, lay_odds)
             if lay_stake <= 0:
                 logger.warning("Invalid green up stake")
@@ -281,9 +300,10 @@ async def _hedge_with_retry(
                     "keep-in-play": False,
                 }
             ]
-            _lock_hedge_fired_for_selection(market_id, runner_id)
+            _mark_hedge_in_flight(market_id, runner_id)
             result = await api.submit_offers(offers)
             if result and result[0].get("status") in ("open", "matched"):
+                _lock_hedge_fired_for_selection(market_id, runner_id)
                 profit = _locked_in_profit_back_hedge(back_stake, back_odds, lay_odds)
                 logger.info(
                     "Hedge placed: Lay %.2f @ %.2f (Green Up) for %s, profit £%.2f",
@@ -311,7 +331,9 @@ async def _hedge_with_retry(
                     )
                     # Hard Lock: hedge_pending + blacklist set by caller BEFORE this call
                 return True, profit
+            _clear_hedge_in_flight(market_id, runner_id)
         except MarketSuspendedError:
+            _clear_hedge_in_flight(market_id, runner_id)
             logger.warning(
                 "Market suspended during hedge (attempt %d/%d), retrying in %ds",
                 attempt + 1,
@@ -320,6 +342,7 @@ async def _hedge_with_retry(
             )
             await asyncio.sleep(config.HEDGE_RETRY_INTERVAL_SEC)
         except Exception as e:
+            _clear_hedge_in_flight(market_id, runner_id)
             logger.exception("Hedge failed: %s", e)
             await asyncio.sleep(config.HEDGE_RETRY_INTERVAL_SEC)
     asyncio.to_thread(
@@ -330,7 +353,9 @@ async def _hedge_with_retry(
     return False, None
 
 
-async def _fetch_back_odds(api: MatchbookAPI, runner_id: int) -> Optional[float]:
+async def _fetch_back_odds(
+    api: MatchbookAPI, runner_id: int, market_id: Optional[int] = None
+) -> Optional[float]:
     """Fetch current best Back odds for a runner from events."""
     events = await api.get_events(
         sport_ids=_get_sport_ids(),
@@ -341,6 +366,8 @@ async def _fetch_back_odds(api: MatchbookAPI, runner_id: int) -> Optional[float]
     )
     for event in events:
         for market in event.get("markets", []):
+            if market_id and int(market.get("id") or 0) != int(market_id):
+                continue
             for runner in market.get("runners", []):
                 if runner.get("id") == runner_id:
                     best_back, _ = _get_best_back_lay(runner.get("prices", []))
@@ -367,12 +394,13 @@ async def _hedge_lay_with_retry(
     """
     for attempt in range(config.MAX_HEDGE_RETRIES):
         try:
-            best_back = await _fetch_back_odds(api, runner_id)
-            if best_back is None or best_back <= 0:
+            # TAKER Back must hit current best Lay price to fill instantly.
+            best_lay = await _fetch_lay_odds(api, runner_id, market_id=market_id)
+            if best_lay is None or best_lay <= 0:
                 logger.warning("No valid back odds for Lay hedge, retrying...")
                 await asyncio.sleep(config.HEDGE_RETRY_INTERVAL_SEC)
                 continue
-            back_odds = best_back
+            back_odds = best_lay
             back_stake = _green_up_back_stake(lay_stake, lay_odds, back_odds)
             if back_stake <= 0:
                 logger.warning("Invalid green up back stake")
@@ -387,9 +415,10 @@ async def _hedge_lay_with_retry(
                     "keep-in-play": False,
                 }
             ]
-            _lock_hedge_fired_for_selection(market_id, runner_id)
+            _mark_hedge_in_flight(market_id, runner_id)
             result = await api.submit_offers(offers)
             if result and result[0].get("status") in ("open", "matched"):
+                _lock_hedge_fired_for_selection(market_id, runner_id)
                 profit = _locked_in_profit_lay_hedge(lay_stake, lay_odds, back_odds)
                 logger.info(
                     "Lay hedge placed: Back %.2f @ %.2f (Green Up) for %s, profit £%.2f",
@@ -417,7 +446,9 @@ async def _hedge_lay_with_retry(
                     )
                     # Hard Lock: hedge_pending + blacklist set by caller BEFORE this call
                 return True, profit
+            _clear_hedge_in_flight(market_id, runner_id)
         except MarketSuspendedError:
+            _clear_hedge_in_flight(market_id, runner_id)
             logger.warning(
                 "Market suspended during Lay hedge (attempt %d/%d), retrying in %ds",
                 attempt + 1,
@@ -426,6 +457,7 @@ async def _hedge_lay_with_retry(
             )
             await asyncio.sleep(config.HEDGE_RETRY_INTERVAL_SEC)
         except Exception as e:
+            _clear_hedge_in_flight(market_id, runner_id)
             logger.exception("Lay hedge failed: %s", e)
             await asyncio.sleep(config.HEDGE_RETRY_INTERVAL_SEC)
     asyncio.to_thread(
@@ -744,7 +776,6 @@ async def _close_events_before_start(api: MatchbookAPI) -> bool:
                 continue  # Hard Lock: selection already hedged, never double exit
             if o.get("side") == "back":
                 if not db.get_paper_trading():
-                    _lock_hedge_fired_for_selection(market_id, runner_id)
                     db.insert_hedge_initiated(parent_id)
                     if pos:
                         db.update_position_to_hedge_pending(pos["id"])
@@ -760,7 +791,6 @@ async def _close_events_before_start(api: MatchbookAPI) -> bool:
                         order_placed = True
             elif o.get("side") == "lay":
                 if not db.get_paper_trading():
-                    _lock_hedge_fired_for_selection(market_id, runner_id)
                     db.insert_hedge_initiated(parent_id)
                     if pos:
                         db.update_position_to_hedge_pending(pos["id"])
@@ -1108,6 +1138,11 @@ async def _process_hedge_confirmations(offers: list[dict]) -> None:
         profit = _net_green_up_profit(lay_stake, back_stake)
         matched_stake = hedge_stake
         matched_odds = _offer_matched_odds(o) or requested_odds
+        expected_parent_stake = float(pos.get("entry_stake") or 0) if pos else parent_stake
+        expected_lay_stake = requested_stake if side == "lay" else expected_parent_stake
+        expected_back_stake = expected_parent_stake if side == "lay" else requested_stake
+        expected_profit = _net_green_up_profit(expected_lay_stake, expected_back_stake)
+        slippage = round(profit - expected_profit, 2)
         db.insert_trade(
             market_id=market_id,
             runner_id=runner_id,
@@ -1120,6 +1155,8 @@ async def _process_hedge_confirmations(offers: list[dict]) -> None:
             offer_id=oid,
             phase=1,
             profit_loss=profit,
+            expected_profit=expected_profit,
+            slippage=slippage,
             event_name=pend.get("event_name", ""),
             reason="Hedge: Lay exit" if side == "lay" else "Hedge: Back exit",
         )
@@ -1130,11 +1167,13 @@ async def _process_hedge_confirmations(offers: list[dict]) -> None:
         db.insert_blacklisted_market(market_id, pend.get("event_id") or 0)
         db.delete_pending_hedge_confirmation(pend["id"])
         logger.info(
-            "Hedge confirmed (API matched/settled): %s %s @ %.2f, profit £%.2f",
+            "Hedge confirmed (API matched/settled): %s %s @ %.2f, expected £%.2f, realized £%.2f, slippage £%.2f",
             pend.get("runner_name", ""),
             side,
             matched_odds,
+            expected_profit,
             profit,
+            slippage,
         )
 
 
@@ -1204,7 +1243,6 @@ async def _process_phase2_leg_monitoring(api: MatchbookAPI) -> None:
                         await api.cancel_offers(offer_ids=[pair["lay_offer_id"]])
                     except Exception as e:
                         logger.warning("Failed to cancel Phase 2 Lay: %s", e)
-                    _lock_hedge_fired_for_selection(pair["market_id"], pair["runner_id"])
                     db.insert_hedge_initiated(pair["back_offer_id"])
                     stake = float(back_o.get("stake", 0) or back_o.get("remaining", 0) or pair["stake"])
                     odds = float(back_o.get("odds", 0) or back_o.get("decimal-odds", 0) or pair["back_odds"])
@@ -1245,7 +1283,6 @@ async def _process_phase2_leg_monitoring(api: MatchbookAPI) -> None:
                         await api.cancel_offers(offer_ids=[pair["back_offer_id"]])
                     except Exception as e:
                         logger.warning("Failed to cancel Phase 2 Back: %s", e)
-                    _lock_hedge_fired_for_selection(pair["market_id"], pair["runner_id"])
                     db.insert_hedge_initiated(pair["lay_offer_id"])
                     stake = float(lay_o.get("stake", 0) or lay_o.get("remaining", 0) or pair["stake"])
                     odds = float(lay_o.get("odds", 0) or lay_o.get("decimal-odds", 0) or pair["lay_odds"])
@@ -1327,8 +1364,7 @@ async def hedge_all_matched_positions(
             if key in open_lay_runners:
                 continue  # Exit state check: Lay hedge already pending, don't stack
             if not db.get_paper_trading():
-                # Hard Lock: selection lock BEFORE any API call (prevents double exit)
-                _lock_hedge_fired_for_selection(market_id, runner_id)
+                # Hard Lock marker for this parent; selection lock is set in hedge submit path.
                 db.insert_hedge_initiated(parent_offer_id)
                 if pos:
                     db.update_position_to_hedge_pending(pos["id"])
@@ -1346,14 +1382,13 @@ async def hedge_all_matched_positions(
             if key in open_back_runners:
                 continue  # Exit state check: Back hedge already pending, don't stack
             if not db.get_paper_trading():
-                # Hard Lock: selection lock BEFORE any API call (prevents double exit)
-                _lock_hedge_fired_for_selection(market_id, runner_id)
+                # Hard Lock marker for this parent; selection lock is set in hedge submit path.
                 db.insert_hedge_initiated(parent_offer_id)
                 if pos:
                     db.update_position_to_hedge_pending(pos["id"])
                 db.insert_blacklisted_market(market_id, event_id)
                 # Lay-first stop-loss: if price dropped N ticks below our Lay odds, log and exit (always taker)
-                current_lay = await _fetch_lay_odds(api, runner_id)
+                current_lay = await _fetch_lay_odds(api, runner_id, market_id=market_id)
                 if current_lay is not None and odds > 0:
                     threshold = odds - config.TICK_SIZE * config.LAY_STOP_LOSS_TICKS
                     if current_lay < threshold:
@@ -1452,7 +1487,9 @@ async def _process_paper_simulated_fills(api: MatchbookAPI) -> None:
             )
 
 
-async def _fetch_lay_odds(api: MatchbookAPI, runner_id: int) -> Optional[float]:
+async def _fetch_lay_odds(
+    api: MatchbookAPI, runner_id: int, market_id: Optional[int] = None
+) -> Optional[float]:
     """Fetch current best Lay odds for a runner from events."""
     events = await api.get_events(
         sport_ids=_get_sport_ids(),
@@ -1463,6 +1500,8 @@ async def _fetch_lay_odds(api: MatchbookAPI, runner_id: int) -> Optional[float]:
     )
     for event in events:
         for market in event.get("markets", []):
+            if market_id and int(market.get("id") or 0) != int(market_id):
+                continue
             for runner in market.get("runners", []):
                 if runner.get("id") == runner_id:
                     _, best_lay = _get_best_back_lay(runner.get("prices", []))
@@ -1544,26 +1583,34 @@ async def _run_phase2(api: MatchbookAPI) -> bool:
                 lay_odds = _round_odds(
                     best_lay - config.TICK_SIZE * config.PHASE2_LAY_TICKS_BELOW
                 )
-                if lay_odds <= back_odds:
-                    continue  # No spread to harvest
-                stake = min(free_funds * 0.05, 10.0)
-                stake = round(stake, 2)
-                if stake < 2.0:
+                # Positive EV only if Back odds are ABOVE Lay odds.
+                if back_odds <= lay_odds:
                     continue
-                liability = _lay_liability(stake, lay_odds)
+                back_stake = round(min(free_funds * 0.05, 10.0), 2)
+                if back_stake < 2.0:
+                    continue
+                lay_stake = _green_up_lay_stake(back_stake, back_odds, lay_odds)
+                if lay_stake < 2.0:
+                    continue
+                liability = _lay_liability(lay_stake, lay_odds)
                 if liability > free_funds:
                     continue
-                spread = lay_odds - back_odds
+                net_green = _net_green_up_profit(lay_stake, back_stake)
+                if net_green <= 0:
+                    continue
+                spread = back_odds - lay_odds
                 if key not in market_candidates:
                     market_candidates[key] = []
-                market_candidates[key].append((event, market, runner, back_odds, lay_odds, stake, spread))
+                market_candidates[key].append(
+                    (event, market, runner, back_odds, lay_odds, back_stake, lay_stake, spread, net_green)
+                )
 
     # One runner per market: pick widest harvestable spread
     phase2_candidates = []
     for key, runners in market_candidates.items():
         if not runners:
             continue
-        best = max(runners, key=lambda r: (r[6], -r[3]))  # max spread, then min back_odds
+        best = max(runners, key=lambda r: (r[8], r[7], -r[3]))  # max net green, then spread
         phase2_candidates.append(best)
 
     # Rule 1: Check for existing orders (matched + unmatched) before Phase 2 entry
@@ -1580,7 +1627,7 @@ async def _run_phase2(api: MatchbookAPI) -> bool:
         except Exception as e:
             logger.warning("Could not fetch offers for Phase 2 pre-entry check: %s", e)
 
-    for event, market, runner, back_odds, lay_odds, stake, _ in phase2_candidates:
+    for event, market, runner, back_odds, lay_odds, back_stake, lay_stake, _, net_green in phase2_candidates:
         market_id = market.get("id", 0)
         runner_id = runner["id"]
         if not _can_enter_selection(market_id, runner_id, exposed_runners):
@@ -1596,7 +1643,7 @@ async def _run_phase2(api: MatchbookAPI) -> bool:
                     runner_name=runner.get("name", ""),
                     side="back",
                     odds=back_odds,
-                    stake=stake,
+                    stake=back_stake,
                     phase=2,
                 )
                 db.insert_paper_order(
@@ -1608,7 +1655,7 @@ async def _run_phase2(api: MatchbookAPI) -> bool:
                     runner_name=runner.get("name", ""),
                     side="lay",
                     odds=lay_odds,
-                    stake=stake,
+                    stake=lay_stake,
                     phase=2,
                 )
                 db.insert_paper_trade(
@@ -1617,7 +1664,7 @@ async def _run_phase2(api: MatchbookAPI) -> bool:
                     runner_name=runner.get("name", ""),
                     side="back",
                     odds=back_odds,
-                    stake=stake,
+                    stake=back_stake,
                     phase=2,
                     reason="Phase 2: Back at spread edge",
                 )
@@ -1627,26 +1674,32 @@ async def _run_phase2(api: MatchbookAPI) -> bool:
                     runner_name=runner.get("name", ""),
                     side="lay",
                     odds=lay_odds,
-                    stake=stake,
+                    stake=lay_stake,
                     phase=2,
                     reason="Phase 2: Lay at spread edge",
                 )
                 db.insert_api_log(
                     "request", "PAPER", "Phase 2 Back+Lay", None,
-                    request_body=f"Would place: {runner.get('name')} Back @ {back_odds} Lay @ {lay_odds} x £{stake}",
+                    request_body=(
+                        f"Would place: {runner.get('name')} Back @ {back_odds} x £{back_stake} "
+                        f"Lay @ {lay_odds} x £{lay_stake} net_green≈£{net_green:.2f}"
+                    ),
                 )
                 logger.info(
-                    "PAPER: Phase 2 would place Back %.2f Lay %.2f @ %.2f for %s",
-                    back_odds, lay_odds, stake, runner.get("name"),
+                    "PAPER: Phase 2 would place Back %.2f x %.2f Lay %.2f x %.2f for %s (net≈£%.2f)",
+                    back_odds, back_stake, lay_odds, lay_stake, runner.get("name"), net_green,
                 )
             else:
                 db.insert_api_log(
                     "request", "LIVE", "Phase 2 submit_offers", None,
-                    request_body=f"Placing Back+Lay: {runner.get('name')} Back @ {back_odds} Lay @ {lay_odds} x £{stake}",
+                    request_body=(
+                        f"Placing Back+Lay: {runner.get('name')} Back @ {back_odds} x £{back_stake} "
+                        f"Lay @ {lay_odds} x £{lay_stake} net_green≈£{net_green:.2f}"
+                    ),
                 )
                 offers = [
-                    {"runner-id": runner["id"], "side": "back", "odds": back_odds, "stake": stake, "keep-in-play": False},
-                    {"runner-id": runner["id"], "side": "lay", "odds": lay_odds, "stake": stake, "keep-in-play": False},
+                    {"runner-id": runner["id"], "side": "back", "odds": back_odds, "stake": back_stake, "keep-in-play": False},
+                    {"runner-id": runner["id"], "side": "lay", "odds": lay_odds, "stake": lay_stake, "keep-in-play": False},
                 ]
                 result = await api.submit_offers(offers)
                 if result:
@@ -1662,7 +1715,7 @@ async def _run_phase2(api: MatchbookAPI) -> bool:
                             market_id=market_id,
                             runner_id=runner_id,
                             event_id=event.get("id", 0),
-                            stake=stake,
+                            stake=back_stake,
                             back_odds=back_odds,
                             lay_odds=lay_odds,
                             market_name=market.get("name", ""),
@@ -1670,7 +1723,15 @@ async def _run_phase2(api: MatchbookAPI) -> bool:
                             event_name=event.get("name", ""),
                         )
                     db.insert_api_log("response", "LIVE", "Phase 2 submit_offers", 200, response_body=f"Orders placed: {len(result)} offers")
-                    logger.info("Phase 2 orders placed: %s Back %.2f Lay %.2f @ %.2f", runner.get("name"), back_odds, lay_odds, stake)
+                    logger.info(
+                        "Phase 2 orders placed: %s Back %.2f x %.2f Lay %.2f x %.2f (net≈£%.2f)",
+                        runner.get("name"),
+                        back_odds,
+                        back_stake,
+                        lay_odds,
+                        lay_stake,
+                        net_green,
+                    )
                     await asyncio.sleep(config.RATE_LIMIT_DELAY_MS / 1000.0)
                     return True  # One market per cycle, order placed
                 else:

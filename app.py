@@ -87,7 +87,7 @@ async def _fetch_live(api: MatchbookAPI):
     """Async fetch of account and offers. Uses persisted session if valid."""
     await api.ensure_auth()
     account = api.get_account()
-    offers = await api.get_offers(statuses=["open", "matched"])
+    offers = await api.get_offers(statuses=["open"])
     balance, exposure, free_funds = _parse_account_balance(account)
     return {
         "balance": balance,
@@ -398,7 +398,10 @@ def main():
 
     phase = 2 if free_funds >= config.PHASE2_MIN_BANKROLL else 1
     phase_label = "Phase 2 (Market Making)" if phase == 2 else "Phase 1 (Scalping)"
-    cumulative_pnl = balance - config.STARTING_BANKROLL
+    baseline_balance = (
+        float(equity_data[0][1]) if equity_data and len(equity_data) > 0 else float(config.STARTING_BANKROLL)
+    )
+    cumulative_pnl = balance - baseline_balance
 
     # Header metrics (5 cols to include Cumulative P&L)
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -417,15 +420,13 @@ def main():
         st.metric("Cumulative P&L (£)", f"£{cumulative_pnl:+.2f}")
 
     # Goal tracker
-    st.subheader("Goal Tracker: £25 → £5,000")
-    progress = (balance - config.STARTING_BANKROLL) / (
-        config.TARGET_BANKROLL - config.STARTING_BANKROLL
-    )
+    st.subheader("Goal Tracker")
+    progress = (balance - baseline_balance) / max(1e-9, (config.TARGET_BANKROLL - baseline_balance))
     progress = max(0, min(1, progress))
     st.progress(progress)
     gross_target = config.gross_roi_target_pct(commission_rate=db.get_commission_rate())
     st.caption(
-        f"£{balance:.2f} / £{config.TARGET_BANKROLL} • "
+        f"Baseline £{baseline_balance:.2f} → £{config.TARGET_BANKROLL:.2f} (now £{balance:.2f}) • "
         f"Target: {config.DAILY_ROI_TARGET_PCT}% net daily ROI "
         f"(≈{gross_target:.1f}% gross after {int(db.get_commission_rate()*100)}% commission)"
     )
@@ -434,40 +435,71 @@ def main():
     st.subheader("Active Positions")
     rows = []
     open_offers_with_id = []  # (offer_id, row) for Cancel buttons
-    seen = set()
+    # Aggregate by (event, market, selection, side) to avoid under-reporting multi-orders.
+    grouped_rows: dict[tuple[str, str, str, str], dict] = {}
     for o in offers:
-        key = (o.get("market-id"), o.get("runner-id"), o.get("side"))
-        if key not in seen:
-            seen.add(key)
-            row = {
-                "Event": o.get("event-name", ""),
-                "Market": o.get("market-name", ""),
-                "Selection": o.get("runner-name", ""),
-                "Side": o.get("side", "").capitalize(),
-                "Odds": o.get("odds") or o.get("decimal-odds"),
-                "Stake": o.get("stake") or o.get("remaining"),
-                "Status": o.get("status", ""),
-                "offer_id": o.get("id"),
+        event_name = o.get("event-name", "")
+        market_name = o.get("market-name", "")
+        runner_name = o.get("runner-name", "")
+        side = (o.get("side", "") or "").capitalize()
+        key = (event_name, market_name, runner_name, side)
+        stake = float(o.get("stake", 0) or o.get("remaining", 0) or 0)
+        odds = float(o.get("odds", 0) or o.get("decimal-odds", 0) or 0)
+        if key not in grouped_rows:
+            grouped_rows[key] = {
+                "Event": event_name,
+                "Market": market_name,
+                "Selection": runner_name,
+                "Side": side,
+                "Odds": odds if odds > 0 else None,
+                "Stake": stake,
+                "Status": "open",
+                "_weighted_odds_num": odds * stake if odds > 0 and stake > 0 else 0.0,
+                "_weighted_stake_den": stake if stake > 0 else 0.0,
             }
-            rows.append(row)
-            if row["Status"] == "open" and row.get("offer_id"):
-                open_offers_with_id.append((row["offer_id"], row))
-    for p in open_positions:
-        key = (p.get("market_id"), p.get("runner_id"), p.get("side"))
-        if key not in seen:
-            seen.add(key)
-            rows.append(
-                {
-                    "Event": "-",
-                    "Market": p.get("market_name", ""),
-                    "Selection": p.get("runner_name", ""),
-                    "Side": p.get("side", "").capitalize(),
-                    "Odds": p.get("entry_odds"),
-                    "Stake": p.get("entry_stake"),
-                    "Status": "open",
-                    "offer_id": None,
-                }
+        else:
+            grouped_rows[key]["Stake"] = float(grouped_rows[key]["Stake"] or 0) + stake
+            if odds > 0 and stake > 0:
+                grouped_rows[key]["_weighted_odds_num"] += odds * stake
+                grouped_rows[key]["_weighted_stake_den"] += stake
+        if o.get("status") == "open" and o.get("id"):
+            open_offers_with_id.append(
+                (
+                    o.get("id"),
+                    {
+                        "Event": event_name,
+                        "Selection": runner_name,
+                        "Odds": odds if odds > 0 else "",
+                    },
+                )
             )
+    for p in open_positions:
+        key = ("-", p.get("market_name", ""), p.get("runner_name", ""), (p.get("side", "") or "").capitalize())
+        stake = float(p.get("entry_stake", 0) or 0)
+        odds = float(p.get("entry_odds", 0) or 0)
+        if key not in grouped_rows:
+            grouped_rows[key] = {
+                "Event": "-",
+                "Market": p.get("market_name", ""),
+                "Selection": p.get("runner_name", ""),
+                "Side": (p.get("side", "") or "").capitalize(),
+                "Odds": odds if odds > 0 else None,
+                "Stake": stake,
+                "Status": "position_open",
+                "_weighted_odds_num": odds * stake if odds > 0 and stake > 0 else 0.0,
+                "_weighted_stake_den": stake if stake > 0 else 0.0,
+            }
+        else:
+            grouped_rows[key]["Stake"] = float(grouped_rows[key]["Stake"] or 0) + stake
+            if odds > 0 and stake > 0:
+                grouped_rows[key]["_weighted_odds_num"] += odds * stake
+                grouped_rows[key]["_weighted_stake_den"] += stake
+    for r in grouped_rows.values():
+        denom = float(r.pop("_weighted_stake_den", 0) or 0)
+        num = float(r.pop("_weighted_odds_num", 0) or 0)
+        if denom > 0:
+            r["Odds"] = round(num / denom, 3)
+        rows.append(r)
     if rows:
         # Display table (exclude offer_id from display)
         display_rows = [{k: v for k, v in r.items() if k != "offer_id"} for r in rows]
@@ -490,8 +522,8 @@ def main():
     st.subheader("Trade History")
     comm_pct = int(db.get_commission_rate() * 100)
     st.caption(
-        f"Profit shown is net of Matchbook commission ({comm_pct}% on winnings). "
-        "Balance from API is already post-commission."
+        f"Profit columns are model-based trade estimates; account balance from API is post-commission "
+        f"({comm_pct}% on winnings)."
     )
     if trades:
         trade_rows = [
@@ -505,7 +537,9 @@ def main():
                 "Stake": t.get("stake"),
                 "Phase": t.get("phase"),
                 "Logic": t.get("reason", ""),
+                "Expected (£)": f"£{t['expected_profit']:.2f}" if t.get("expected_profit") is not None else "-",
                 "Profit (£)": f"£{t['profit_loss']:.2f}" if t.get("profit_loss") is not None else "-",
+                "Slippage (£)": f"£{t['slippage']:.2f}" if t.get("slippage") is not None else "-",
             }
             for t in trades
         ]
