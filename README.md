@@ -39,12 +39,13 @@ cp .env.example .env
 docker compose up -d
 ```
 
-- **Bot**: Runs every 60 seconds, shares SQLite DB with dashboard
+- **Bot**: Runs continuously; default cycle every 5 seconds (configurable via `BOT_CYCLE_INTERVAL_SEC` in `.env`), shares SQLite DB with dashboard
 - **Dashboard**: http://localhost:8502
 
 ## When the Bot Trades
 
-- **Docker**: Each cycle (every 60s) the bot logs in, records a bankroll snapshot, then places orders if trading is enabled.
+- **Docker**: Each cycle (default every 5s) the bot logs in, records a bankroll snapshot, then places orders if trading is enabled.
+- **Cycle tuning**: Set `BOT_CYCLE_INTERVAL_SEC` in `.env` (recommended 3-10s for fast hedge reaction).
 - **On/Off toggle**: Use the sidebar "Trading enabled" toggle to pause. When paused, the bot still records snapshots but places no orders.
 - **Daily stop-loss**: If today's loss exceeds `DAILY_STOP_LOSS_PCT` (default 10%) of start-of-day bankroll, trading pauses. Clear via sidebar to resume.
 - **Paper trading**: Toggle in sidebar. No real orders—bot runs logic and logs "would place" only. Safe for testing.

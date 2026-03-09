@@ -178,6 +178,16 @@ def init_db() -> None:
                 PRIMARY KEY (market_id, runner_id)
             );
 
+            CREATE TABLE IF NOT EXISTS completed_hedges (
+                offer_id INTEGER PRIMARY KEY,
+                parent_offer_id INTEGER,
+                market_id INTEGER,
+                runner_id INTEGER,
+                side TEXT,
+                completed_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_completed_hedges_parent ON completed_hedges(parent_offer_id);
+
             CREATE TABLE IF NOT EXISTS phase2_leg_pairs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 back_offer_id INTEGER NOT NULL,
@@ -476,6 +486,50 @@ def insert_hedged_selection(market_id: int, runner_id: int) -> None:
         conn.close()
 
 
+def insert_completed_hedge_offer(
+    offer_id: int,
+    parent_offer_id: Optional[int] = None,
+    market_id: Optional[int] = None,
+    runner_id: Optional[int] = None,
+    side: str = "",
+) -> None:
+    """Persist completed/child hedge offer IDs so recovery never re-adopts them."""
+    if offer_id is None:
+        return
+    conn = get_connection()
+    try:
+        try:
+            oid = int(offer_id)
+        except (TypeError, ValueError):
+            return
+        conn.execute(
+            """INSERT OR IGNORE INTO completed_hedges
+               (offer_id, parent_offer_id, market_id, runner_id, side, completed_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                oid,
+                int(parent_offer_id) if parent_offer_id is not None else None,
+                int(market_id) if market_id is not None else None,
+                int(runner_id) if runner_id is not None else None,
+                side or "",
+                datetime.utcnow().isoformat(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_completed_hedge_offer_ids() -> set[int]:
+    """Return offer IDs already known as completed hedge legs."""
+    conn = get_connection()
+    try:
+        rows = conn.execute("SELECT offer_id FROM completed_hedges").fetchall()
+        return {int(r[0]) for r in rows if r[0] is not None}
+    finally:
+        conn.close()
+
+
 # --- Phase 2 Leg Timer (adverse selection protection) ---
 
 
@@ -601,6 +655,11 @@ def get_all_tracked_offer_ids() -> set[int]:
         for row in conn.execute(
             "SELECT back_offer_id, lay_offer_id FROM phase2_leg_pairs WHERE status = 'active'"
         ):
+            if row[0] is not None:
+                ids.add(int(row[0]))
+            if row[1] is not None:
+                ids.add(int(row[1]))
+        for row in conn.execute("SELECT offer_id, parent_offer_id FROM completed_hedges"):
             if row[0] is not None:
                 ids.add(int(row[0]))
             if row[1] is not None:

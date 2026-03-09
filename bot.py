@@ -260,6 +260,33 @@ def _offer_matched_odds(offer: dict) -> float:
     )
 
 
+def _is_opposite_side_matched_loop(offers_for_runner: list[dict]) -> bool:
+    """
+    Detect already-completed parent/child loops from API data:
+    at least one matched/settled Back and one matched/settled Lay
+    with near-equal stake on same selection.
+    """
+    matched = [
+        o for o in offers_for_runner
+        if (o.get("status", "").lower() in ("matched", "settled"))
+    ]
+    backs = [o for o in matched if (o.get("side", "").lower() == "back")]
+    lays = [o for o in matched if (o.get("side", "").lower() == "lay")]
+    if not backs or not lays:
+        return False
+    for b in backs:
+        bs = _offer_matched_stake(b)
+        if bs <= 0:
+            continue
+        for l in lays:
+            ls = _offer_matched_stake(l)
+            if ls <= 0:
+                continue
+            if abs(bs - ls) <= 0.05:  # small tolerance for rounding/partial effects
+                return True
+    return False
+
+
 async def _hedge_with_retry(
     api: MatchbookAPI,
     runner_id: int,
@@ -304,6 +331,13 @@ async def _hedge_with_retry(
             result = await api.submit_offers(offers)
             if result and result[0].get("status") in ("open", "matched"):
                 _lock_hedge_fired_for_selection(market_id, runner_id)
+                db.insert_completed_hedge_offer(
+                    offer_id=result[0].get("id"),
+                    parent_offer_id=back_offer_id,
+                    market_id=market_id,
+                    runner_id=runner_id,
+                    side="lay",
+                )
                 profit = _locked_in_profit_back_hedge(back_stake, back_odds, lay_odds)
                 logger.info(
                     "Hedge placed: Lay %.2f @ %.2f (Green Up) for %s, profit £%.2f",
@@ -419,6 +453,13 @@ async def _hedge_lay_with_retry(
             result = await api.submit_offers(offers)
             if result and result[0].get("status") in ("open", "matched"):
                 _lock_hedge_fired_for_selection(market_id, runner_id)
+                db.insert_completed_hedge_offer(
+                    offer_id=result[0].get("id"),
+                    parent_offer_id=lay_offer_id,
+                    market_id=market_id,
+                    runner_id=runner_id,
+                    side="back",
+                )
                 profit = _locked_in_profit_lay_hedge(lay_stake, lay_odds, back_odds)
                 logger.info(
                     "Lay hedge placed: Back %.2f @ %.2f (Green Up) for %s, profit £%.2f",
@@ -574,7 +615,13 @@ async def _run_startup_state_recovery(api: MatchbookAPI) -> None:
     if not offers:
         return
     tracked = db.get_all_tracked_offer_ids()
-    orphans = [o for o in offers if o.get("id") is not None and int(o.get("id")) not in tracked]
+    completed_hedges = db.get_completed_hedge_offer_ids()
+    orphans = [
+        o for o in offers
+        if o.get("id") is not None
+        and int(o.get("id")) not in tracked
+        and int(o.get("id")) not in completed_hedges
+    ]
     if not orphans:
         return
     logger.info("Startup state recovery: found %d orphaned order(s) on exchange", len(orphans))
@@ -587,6 +634,24 @@ async def _run_startup_state_recovery(api: MatchbookAPI) -> None:
             by_runner.setdefault(key, []).append(o)
     for key, runner_offers in by_runner.items():
         market_id, runner_id = key
+        # If we already have a matched opposite-side loop, this is completed;
+        # never adopt back into Phase 1 tracker.
+        if _is_opposite_side_matched_loop(runner_offers):
+            for o in runner_offers:
+                oid = o.get("id")
+                if oid is not None:
+                    db.insert_completed_hedge_offer(
+                        offer_id=oid,
+                        market_id=market_id,
+                        runner_id=runner_id,
+                        side=str(o.get("side") or ""),
+                    )
+            logger.info(
+                "Recovery: skipping completed parent/child loop for %s (market %s)",
+                runner_offers[0].get("runner-name", "") if runner_offers else "",
+                market_id,
+            )
+            continue
         backs = [o for o in runner_offers if (o.get("side") or "").lower() == "back"]
         lays = [o for o in runner_offers if (o.get("side") or "").lower() == "lay"]
         lay_o = lays[0] if lays else None
@@ -1159,6 +1224,13 @@ async def _process_hedge_confirmations(offers: list[dict]) -> None:
             slippage=slippage,
             event_name=pend.get("event_name", ""),
             reason="Hedge: Lay exit" if side == "lay" else "Hedge: Back exit",
+        )
+        db.insert_completed_hedge_offer(
+            offer_id=oid,
+            parent_offer_id=pend.get("back_offer_id"),
+            market_id=market_id,
+            runner_id=runner_id,
+            side=side,
         )
         if pos:
             db.update_position(pos["id"], "closed", profit)

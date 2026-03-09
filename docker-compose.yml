@@ -1,7 +1,7 @@
 services:
   bot:
     build: .
-    command: sh -c "while true; do python bot.py; sleep 60; done"
+    command: sh -c "while true; do python bot.py; sleep ${BOT_CYCLE_INTERVAL_SEC:-5}; done"
     env_file: .env
     volumes:
       - bot_data:/app/data
