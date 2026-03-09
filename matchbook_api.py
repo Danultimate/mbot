@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import aiohttp
@@ -89,6 +90,33 @@ class MatchbookAPI:
         except Exception:
             pass
 
+    @staticmethod
+    def _get_login_blocked_until() -> Optional[datetime]:
+        """Return UTC datetime until which login attempts should be suppressed."""
+        raw = db.get_setting_value("login_blocked_until")
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except (ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _set_login_blocked_for(seconds: int) -> None:
+        """Persist login cooldown to prevent repeated 429 hammering."""
+        if seconds <= 0:
+            return
+        until = datetime.now(timezone.utc) + timedelta(seconds=int(seconds))
+        db.set_setting_value("login_blocked_until", until.isoformat())
+
+    @staticmethod
+    def _clear_login_block() -> None:
+        """Clear persisted login cooldown after a successful auth."""
+        db.clear_setting_value("login_blocked_until")
+
     async def _ensure_session(self) -> aiohttp.ClientSession:
         """Create or return existing aiohttp session."""
         if self._session is None or self._session.closed:
@@ -139,6 +167,13 @@ class MatchbookAPI:
         payload = {"username": username, "password": password}
 
         try:
+            blocked_until = self._get_login_blocked_until()
+            if blocked_until and blocked_until > datetime.now(timezone.utc):
+                wait_sec = int((blocked_until - datetime.now(timezone.utc)).total_seconds())
+                raise MatchbookAPIError(
+                    429,
+                    f"Login temporarily blocked due to previous 429. Retry-After: {wait_sec}s",
+                )
             safe_payload = {k: ("***" if k == "password" else v) for k, v in payload.items()}
             db.insert_api_log("request", "POST", url, request_body=json.dumps(safe_payload))
             async with session.post(
@@ -171,6 +206,7 @@ class MatchbookAPI:
                         except Exception as e:
                             logger.warning("Could not fetch balance from /account/balance: %s", e)
                     self._save_session()
+                    self._clear_login_block()
                     logger.info("Login successful (session persisted)")
                     return data
                 else:
@@ -179,8 +215,13 @@ class MatchbookAPI:
                     if resp.status == 429:
                         retry_after = resp.headers.get("Retry-After")
                         if retry_after:
+                            try:
+                                self._set_login_block_for(int(float(retry_after)))
+                            except (TypeError, ValueError):
+                                pass
                             err_msg = f"Login rate-limited (429). Retry-After: {retry_after}s"
                         else:
+                            self._set_login_block_for(120)
                             err_msg = "Login rate-limited (429). Too many auth attempts."
                     try:
                         err_data = json.loads(body)
@@ -207,6 +248,13 @@ class MatchbookAPI:
 
     async def ensure_auth(self) -> None:
         """Ensure we have a session. Only login if token missing (session expired)."""
+        blocked_until = self._get_login_blocked_until()
+        if blocked_until and blocked_until > datetime.now(timezone.utc):
+            wait_sec = int((blocked_until - datetime.now(timezone.utc)).total_seconds())
+            raise MatchbookAPIError(
+                429,
+                f"Auth login cooldown active. Retry-After: {wait_sec}s",
+            )
         if not self._session_token:
             await self.login()
 

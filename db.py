@@ -1028,6 +1028,39 @@ def get_bot_enabled() -> bool:
         conn.close()
 
 
+def get_setting_value(key: str) -> Optional[str]:
+    """Generic settings getter. Returns raw string value or None."""
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return str(row[0]) if row and row[0] is not None else None
+    finally:
+        conn.close()
+
+
+def set_setting_value(key: str, value: str) -> None:
+    """Generic settings setter (upsert)."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (key, str(value)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_setting_value(key: str) -> None:
+    """Delete a setting key."""
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def get_api_session() -> Optional[tuple[str, str]]:
     """Return (session_token, account_json) or None."""
     conn = get_connection()
