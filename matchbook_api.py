@@ -216,12 +216,12 @@ class MatchbookAPI:
                         retry_after = resp.headers.get("Retry-After")
                         if retry_after:
                             try:
-                                self._set_login_block_for(int(float(retry_after)))
+                                self._set_login_blocked_for(int(float(retry_after)))
                             except (TypeError, ValueError):
                                 pass
                             err_msg = f"Login rate-limited (429). Retry-After: {retry_after}s"
                         else:
-                            self._set_login_block_for(120)
+                            self._set_login_blocked_for(120)
                             err_msg = "Login rate-limited (429). Too many auth attempts."
                     try:
                         err_data = json.loads(body)
