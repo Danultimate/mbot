@@ -176,6 +176,12 @@ class MatchbookAPI:
                 else:
                     await self._check_suspended(resp.status, body)
                     err_msg = "Login failed"
+                    if resp.status == 429:
+                        retry_after = resp.headers.get("Retry-After")
+                        if retry_after:
+                            err_msg = f"Login rate-limited (429). Retry-After: {retry_after}s"
+                        else:
+                            err_msg = "Login rate-limited (429). Too many auth attempts."
                     try:
                         err_data = json.loads(body)
                         msgs = err_data.get("errors", [{}])[0].get("messages", [])
@@ -211,7 +217,8 @@ class MatchbookAPI:
         Make HTTP request. On 401, clear session, login, retry once.
         Returns (status_code, body).
         """
-        req_headers = kwargs.pop("headers", None) or self._auth_headers()
+        custom_headers = kwargs.pop("headers", None)
+        req_headers = custom_headers or self._auth_headers()
         req_body = json.dumps(kwargs.get("json")) if kwargs.get("json") else (str(kwargs.get("params")) if kwargs.get("params") else None)
         db.insert_api_log("request", method, url, request_body=req_body)
         session = await self._ensure_session()
@@ -224,9 +231,21 @@ class MatchbookAPI:
             if resp.status == 401 and retry_on_401 and self._session_token:
                 self._clear_session()
                 await self.login()
+                # IMPORTANT: rebuild headers with the fresh session-token.
+                retry_headers = dict(custom_headers) if custom_headers else {}
+                if self._session_token:
+                    retry_headers["session-token"] = self._session_token
+                else:
+                    retry_headers.pop("session-token", None)
+                if "Content-Type" not in retry_headers:
+                    retry_headers["Content-Type"] = "application/json"
+                if "Accept" not in retry_headers:
+                    retry_headers["Accept"] = "application/json"
+                if "Accept-Encoding" not in retry_headers:
+                    retry_headers["Accept-Encoding"] = "gzip"
                 db.insert_api_log("request", method, url, request_body="(retry after 401)")
                 async with session.request(
-                    method, url, headers=req_headers, **kwargs
+                    method, url, headers=retry_headers, **kwargs
                 ) as retry_resp:
                     retry_body = await retry_resp.text()
                     await self._rate_limit()
